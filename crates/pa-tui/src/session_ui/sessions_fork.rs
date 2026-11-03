@@ -516,11 +516,11 @@ pub(super) async fn create_session(
     // TS main.ts `launchEnv` (:1092): the client's own environment
     // travels on the create so the session's worker runs in the
     // environment of the terminal that opened it, not the daemon's
-    // boot environment.
-    let launch_env = {
-        let env = pa_types::daemon::launch_env::collect_process_launch_env();
-        (!env.is_empty()).then_some(env)
-    };
+    // boot environment. A remote daemon keeps its own: this machine's HOME
+    // and PATH would point its worker at paths that do not exist there.
+    let launch_env = (client.host() == crate::daemon_client::DaemonHost::Local)
+        .then(pa_types::daemon::launch_env::collect_process_launch_env)
+        .filter(|env| !env.is_empty());
     let data = match client
         .request_ok(DaemonCommand::Create {
             id: None,

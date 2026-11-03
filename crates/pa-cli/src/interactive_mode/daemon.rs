@@ -21,7 +21,8 @@ const DAEMON_PROBE_INTERVAL_MS: u64 = 1;
 
 enum DaemonProbe {
     Absent,
-    Current,
+    /// A current supervisor answered; it runs at the carried placement.
+    Current(pa_tui::daemon_client::DaemonHost),
     /// A supervisor answered with a different protocol/schema. The client rides
     /// boxed: its size is platform-dependent, so the box keeps the other arms small.
     Stale(Box<pa_tui::daemon_client::DaemonClient>),
@@ -40,8 +41,9 @@ async fn probe_daemon(socket_path: &Path) -> DaemonProbe {
         ))
         && hello.get("schemaId") == Some(&serde_json::json!(pa_types::daemon::DAEMON_SCHEMA_ID));
     if current {
+        let host = client.host();
         client.close();
-        DaemonProbe::Current
+        DaemonProbe::Current(host)
     } else {
         DaemonProbe::Stale(Box::new(client))
     }
@@ -49,20 +51,25 @@ async fn probe_daemon(socket_path: &Path) -> DaemonProbe {
 
 /// Ensure a current daemon is listening on `socket_path`, spawning this
 /// executable in `--mode daemon` when it is not (a stale idle daemon is
-/// shut down, a busy one refuses replacement).
+/// shut down, a busy one refuses replacement), and report where it runs.
 ///
 /// # Errors
 /// Returns an error when the executable path cannot be resolved, a stale
 /// daemon refuses replacement, the supervisor cannot be spawned, or no
 /// current daemon starts before the startup timeout.
-pub async fn ensure_daemon_running(socket_path: &Path, spawn_cwd: &Path) -> Result<()> {
+pub async fn ensure_daemon_running(
+    socket_path: &Path,
+    spawn_cwd: &Path,
+) -> Result<pa_tui::daemon_client::DaemonHost> {
     match probe_daemon(socket_path).await {
-        DaemonProbe::Current => return Ok(()),
+        DaemonProbe::Current(host) => return Ok(host),
         DaemonProbe::Stale(client) => shutdown_stale_daemon(*client, socket_path).await?,
         DaemonProbe::Absent => {}
     }
     let exe = std::env::current_exe().context("resolve the prime-agent executable")?;
-    ensure_daemon_running_with(&exe, socket_path, spawn_cwd).await
+    ensure_daemon_running_with(&exe, socket_path, spawn_cwd).await?;
+    // This process spawned it (or lost the race to a local launcher).
+    Ok(pa_tui::daemon_client::DaemonHost::Local)
 }
 
 /// [`ensure_daemon_running`] with an explicit supervisor executable (the
@@ -77,7 +84,7 @@ pub async fn ensure_daemon_running_with(
     spawn_cwd: &Path,
 ) -> Result<()> {
     match probe_daemon(socket_path).await {
-        DaemonProbe::Current => return Ok(()),
+        DaemonProbe::Current(_) => return Ok(()),
         DaemonProbe::Stale(client) => {
             // A stale daemon appeared between the caller's check and here:
             // fall through to the spawn path after refusing busy ones.
@@ -89,7 +96,7 @@ pub async fn ensure_daemon_running_with(
     let deadline = Instant::now() + Duration::from_millis(DAEMON_STARTUP_TIMEOUT_MS);
     loop {
         match probe_daemon(socket_path).await {
-            DaemonProbe::Current => return Ok(()),
+            DaemonProbe::Current(_) => return Ok(()),
             DaemonProbe::Stale(client) => {
                 // A concurrent launcher won the socket with a build whose protocol matches at
                 // connect time but failed the schema check: re-probe before deciding.
@@ -108,11 +115,25 @@ pub async fn ensure_daemon_running_with(
 }
 
 /// Shut a stale daemon down when no session is busy; a busy one refuses
-/// replacement.
+/// replacement. A remote daemon is never replaced from here: the spawn that
+/// follows a shutdown would start a local daemon on the forwarded path.
 async fn shutdown_stale_daemon(
     client: pa_tui::daemon_client::DaemonClient,
     socket_path: &Path,
 ) -> Result<()> {
+    if client.host() != pa_tui::daemon_client::DaemonHost::Local {
+        let version = client
+            .hello()
+            .get("appVersion")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        client.close();
+        return Err(anyhow!(
+            "The remote Prime Agent daemon on {} runs an incompatible version ({version}). Update Prime Agent on the daemon's machine and restart its daemon, then retry.",
+            socket_path.display()
+        ));
+    }
     let sessions = client
         .request_ok(pa_types::daemon::DaemonCommand::List {
             id: None,

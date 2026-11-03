@@ -274,6 +274,11 @@ pub enum DaemonOutbound {
         /// reconnecting client knows whether to queue its attach. Rust-only extension.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         update_resume: Option<crate::daemon::update_flow::DaemonUpdateResume>,
+        /// The supervisor's working directory: where a create that carries no `cwd` starts. A
+        /// client that does not share the daemon's filesystem uses it in place of its own.
+        /// Rust-only extension.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
         client_id: DaemonClientId,
         server_capabilities: Vec<DaemonServerCapability>,
         #[serde(flatten)]

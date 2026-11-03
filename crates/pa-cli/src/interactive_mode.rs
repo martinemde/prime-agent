@@ -39,7 +39,7 @@ mod tests;
 pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
     let socket_path = resolve_socket_path(options.daemon_socket.as_deref());
     let configuration_load_started = std::time::Instant::now();
-    let (tui_options, pending_onboarding_stages) = build_tui_options(
+    let (mut tui_options, pending_onboarding_stages) = build_tui_options(
         options,
         socket_path,
         std::sync::Arc::new(std::sync::Mutex::new(
@@ -97,7 +97,18 @@ pub fn run_interactive_mode(options: &RunOptions) -> Result<i32> {
             .track(client);
         }
         let attach_started = std::time::Instant::now();
-        ensure_daemon_running(&tui_options.socket_path, &tui_options.cwd).await?;
+        let host = ensure_daemon_running(&tui_options.socket_path, &tui_options.cwd).await?;
+        // A daemon behind a forwarded socket cannot use this machine's paths: new sessions
+        // start in the daemon's own directory and persist where it keeps sessions, unless
+        // a flag named the session directory.
+        if let pa_tui::daemon_client::DaemonHost::Remote { cwd } = host {
+            if let Some(cwd) = cwd {
+                tui_options.cwd = cwd;
+            }
+            tui_options
+                .session_dir
+                .clone_from(&options.session.session_dir);
+        }
         if let Some(client) = startup_telemetry.as_ref() {
             pa_telemetry::AgentStartupStage {
                 stage: "session_attach",

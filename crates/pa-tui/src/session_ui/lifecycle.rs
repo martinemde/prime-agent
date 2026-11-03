@@ -434,6 +434,19 @@ impl SessionUi {
             .and_then(Value::as_str)
             .filter(|file| !file.is_empty())
             .map(str::to_string);
+        // A remote daemon's session runs in a directory this client cannot see:
+        // the chrome and `/new` follow the session's own cwd, not the launch one.
+        if self.client.host() != crate::daemon_client::DaemonHost::Local {
+            if let Some(cwd) = attach
+                .snapshot
+                .get("state")
+                .and_then(|state| state.get("cwd"))
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+            {
+                self.cwd = std::path::PathBuf::from(cwd);
+            }
+        }
         // The subagent summary follows the fresh session's family; the focus
         // returns to the editor.
         self.roster.clear();
@@ -636,6 +649,7 @@ impl SessionUi {
         // Any browse selection belonged to the previous queue and drops.
         let _ = self.queue_selection.reset();
         view.queue_selected = None;
+        view.chrome.cwd = self.cwd.to_string_lossy().to_string();
         view.chrome.chat_name = self.session_display();
         view.chrome.context = self.context;
         // The rebuilt transcript invalidates the announcement row tracking;

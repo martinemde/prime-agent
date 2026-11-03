@@ -215,6 +215,55 @@ fn launcher_client_child_mode() {
         .expect("launch supervisor");
 }
 
+/// A client that reaches the daemon through a forwarded socket (an SSH
+/// stream-local forward, here a byte relay) shares no filesystem with it:
+/// the launcher reports it remote with the daemon's own cwd, while the
+/// daemon's own socket stays local.
+#[test]
+fn a_forwarded_socket_reaches_a_remote_daemon() {
+    use pa_tui::daemon_client::DaemonHost;
+    let fixture = tempfile::tempdir().expect("fixture");
+    let socket = fixture.path().join("daemon.sock");
+    let _daemon = spawn_daemon(
+        &socket,
+        &fixture.path().join("agent"),
+        &fixture.path().join("tmp"),
+    );
+    let forwarded = fixture.path().join("forwarded.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&forwarded).expect("bind forward");
+    let target = socket.clone();
+    std::thread::spawn(move || {
+        for client in listener.incoming().flatten() {
+            let daemon = UnixStream::connect(&target).expect("reach daemon");
+            let (mut upstream, mut downstream) = (
+                daemon.try_clone().expect("clone"),
+                client.try_clone().expect("clone"),
+            );
+            let (mut client, mut daemon) = (client, daemon);
+            std::thread::spawn(move || std::io::copy(&mut client, &mut upstream));
+            std::thread::spawn(move || std::io::copy(&mut daemon, &mut downstream));
+        }
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let hosts = [&socket, &forwarded].map(|path| {
+        runtime
+            .block_on(pa_cli::ensure_daemon_running(path, fixture.path()))
+            .expect("daemon answers")
+    });
+    assert_eq!(
+        hosts,
+        [
+            DaemonHost::Local,
+            DaemonHost::Remote {
+                cwd: Some(std::env::current_dir().expect("cwd")),
+            },
+        ]
+    );
+}
+
 /// Cleanup for a daemon spawned by the interactive launcher rather than by
 /// this test process's `Command`, including a failed assertion's unwind:
 /// write the force-shutdown command over the wire, wait for the supervisor

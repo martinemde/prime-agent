@@ -342,6 +342,7 @@ impl Worker {
             // The worker's hello carries no resume contract (the
             // supervisor owns the boot restore pass).
             update_resume: None,
+            cwd: None,
             client_id: crate::util::new_display_id(),
             server_capabilities: factory_capabilities,
             rest: Map::default(),

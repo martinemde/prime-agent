@@ -545,14 +545,18 @@ impl AgentsViewMode {
 
     /// The view's create config with the saved session's cwd removed — or
     /// overridden with the view's cwd (and its notice) when the saved directory no
-    /// longer exists.
+    /// longer exists. A remote daemon's directories cannot be checked here: it
+    /// reopens the saved cwd itself.
     fn resume_config(&self, summary: &Value) -> (Value, Option<String>) {
         let mut config = self.options.create_config.clone();
         let saved_cwd = summary
             .get("cwd")
             .and_then(Value::as_str)
             .filter(|cwd| !cwd.is_empty());
-        let exists = saved_cwd.is_some_and(|cwd| std::path::Path::new(cwd).exists());
+        let exists = saved_cwd.is_some_and(|cwd| {
+            self.daemon_host != crate::daemon_client::DaemonHost::Local
+                || std::path::Path::new(cwd).exists()
+        });
         let fallback = self.options.cwd.to_string_lossy().to_string();
         let notice = if saved_cwd.is_none_or(|_| exists) {
             None

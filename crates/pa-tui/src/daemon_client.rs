@@ -24,6 +24,7 @@ use crate::direct_transport::{
 };
 
 mod errors;
+mod host;
 #[cfg(all(test, unix))]
 mod tests;
 
@@ -32,6 +33,7 @@ pub use errors::{
     is_daemon_rejection, is_daemon_timeout, is_daemon_unreachable, is_kernel_not_running,
     is_update_restarting_rejection, rejected_provider_unauthenticated, RequestRejected,
 };
+pub use host::{daemon_host, DaemonHost};
 
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// Requests whose completion is bounded by the turn itself
@@ -537,6 +539,12 @@ impl DaemonClient {
         &self.hello
     }
 
+    /// Where this client's daemon runs (see [`DaemonHost`]).
+    #[must_use]
+    pub fn host(&self) -> DaemonHost {
+        daemon_host(&self.socket_path, &self.hello)
+    }
+
     /// Send one command envelope and wait for the matching response, using
     /// the TS default timeout for the command class.
     ///
@@ -798,7 +806,8 @@ impl DaemonClient {
     ///
     /// Never returns `Err`: every failure path returns `Ok(false)`.
     pub async fn upgrade_direct(&self, active_session_id: &str) -> Result<bool> {
-        if !supervisor_supports_direct(&self.hello) {
+        // A remote daemon's worker sockets are paths on its machine, never reachable here.
+        if !supervisor_supports_direct(&self.hello) || self.host() != DaemonHost::Local {
             return Ok(false);
         }
         if self.direct_session_id().as_deref() == Some(active_session_id) {

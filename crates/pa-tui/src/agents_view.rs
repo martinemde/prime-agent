@@ -427,6 +427,8 @@ struct AgentsViewMode {
     /// The double-Ctrl+C force-quit guard (the shared instance is installed by `run_agents_view`
     /// after `new`).
     exit_guard: crate::exit_guard::ExitGuard,
+    /// Where the view's daemon runs: a remote daemon owns the saved directories' checks.
+    daemon_host: crate::daemon_client::DaemonHost,
     pulse: usize,
     running: bool,
     /// The view exited through its parent key: the flow pops the scope frame.
@@ -565,6 +567,7 @@ impl AgentsViewMode {
             search_return: None,
             exit_armed: false,
             exit_guard: crate::exit_guard::ExitGuard::new(),
+            daemon_host: crate::daemon_client::DaemonHost::Local,
             pulse: 0,
             running: true,
             scope_popped: false,
@@ -783,6 +786,7 @@ async fn run_agents_view_surface(
     let exit_guard = crate::exit_guard::ExitGuard::new();
     let mut mode = AgentsViewMode::new(options.clone());
     mode.exit_guard = exit_guard.clone();
+    mode.daemon_host = client.host();
 
     mode.roster = roster;
     // The flow's carried catalog paints on the FIRST frame (a loaded catalog means no fetch
