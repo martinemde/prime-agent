@@ -829,6 +829,24 @@ impl Supervisor {
                     false,
                 )
             }
+            DaemonCommand::SearchFiles {
+                cwd,
+                scope,
+                pattern,
+                case_insensitive,
+                full_path,
+                ..
+            } => {
+                let request = crate::file_search::SearchFilesRequest {
+                    cwd: cwd.clone(),
+                    scope: scope.clone(),
+                    pattern: pattern.clone(),
+                    case_insensitive: *case_insensitive,
+                    full_path: *full_path,
+                };
+                let line = crate::file_search::respond(&command_id, &type_name, request).await;
+                (vec![line], false)
+            }
             DaemonCommand::ListPersistentShells { .. } => {
                 // The machine-wide persistent shells, each with its assigned session id.
                 let agent_dir = self.options.agent_dir.clone();

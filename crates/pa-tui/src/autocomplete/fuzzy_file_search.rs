@@ -69,12 +69,19 @@ pub(super) fn lookup(
 
 /// Start the background walk for the typed `@` token.
 fn spawn(base: &Path, at_prefix: String) -> FileSearch {
+    let base = base.to_path_buf();
+    spawn_search(move |cancel| search(&base, &at_prefix, cancel))
+}
+
+/// Run one search on its own thread; its result lands on the handle's receiver.
+pub(super) fn spawn_search(
+    run: impl FnOnce(&AtomicBool) -> Option<Suggestions> + Send + 'static,
+) -> FileSearch {
     let (tx, results) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
-    let base = base.to_path_buf();
     let thread_cancel = Arc::clone(&cancel);
     thread::spawn(move || {
-        let _ = tx.send(search(&base, &at_prefix, &thread_cancel));
+        let _ = tx.send(run(&thread_cancel));
     });
     FileSearch { results, cancel }
 }
@@ -210,13 +217,21 @@ struct ScopedQuery {
     display_base: String,
 }
 
+/// Split a query at its last `/` into the typed directory (with its `/`) and the
+/// query inside it.
+pub(super) fn split_scope(raw_query: &str) -> Option<(String, String)> {
+    let normalized = to_display_path(raw_query);
+    let slash_index = normalized.rfind('/')?;
+    Some((
+        normalized[..=slash_index].to_string(),
+        normalized[slash_index + 1..].to_string(),
+    ))
+}
+
 /// Split a scoped query at its last `/`: the typed directory must
 /// exist, else the query stays unscoped.
 fn resolve_scoped_query(base: &Path, raw_query: &str) -> Option<ScopedQuery> {
-    let normalized = to_display_path(raw_query);
-    let slash_index = normalized.rfind('/')?;
-    let display_base = normalized[..=slash_index].to_string();
-    let query = normalized[slash_index + 1..].to_string();
+    let (display_base, query) = split_scope(raw_query)?;
     let base_dir = if display_base.starts_with("~/") {
         PathBuf::from(expand_home_path(&display_base))
     } else if display_base.starts_with('/') {
@@ -292,38 +307,75 @@ pub(super) fn resolve_search(
         Some(scoped) => (scoped.base_dir.clone(), scoped.query.clone()),
         None => (base.to_path_buf(), raw_query),
     };
-    // The fd pattern is the raw query as a regex (smart case), matched against the file
-    // name — or the whole path when the query contains a `/`. An empty query matches everything.
-    let pattern = build_fd_path_query(&query);
-    let full_path_mode = to_display_path(&query).contains('/');
+    let scope = match &scoped_query {
+        Some(scoped) => index_scope(&scoped.display_base),
+        None => IndexScope::Unscoped,
+    };
+    let typed = TypedQuery {
+        at_prefix,
+        is_quoted_prefix,
+        display_base: scoped_query
+            .as_ref()
+            .map(|scoped| scoped.display_base.as_str()),
+        query: &query,
+    };
+    with_search(&typed, &walk_base, cancel, |search| answer(search, &scope))
+}
+
+/// The typed `@` token after its scope split: what the fd pattern and the ranking read.
+pub(super) struct TypedQuery<'a> {
+    pub(super) at_prefix: &'a str,
+    pub(super) is_quoted_prefix: bool,
+    pub(super) display_base: Option<&'a str>,
+    pub(super) query: &'a str,
+}
+
+/// The fd pattern of a query: the raw query as a regex, matched against the file name — or
+/// the whole path when the query contains a `/` (the `bool`). Smart case: an uppercase letter
+/// makes it case-sensitive. An empty pattern matches everything.
+pub(super) fn fd_pattern(query: &str) -> (String, bool) {
+    (
+        build_fd_path_query(query),
+        to_display_path(query).contains('/'),
+    )
+}
+
+/// Whether an fd pattern matches case-insensitively (smart case).
+pub(super) fn fd_case_insensitive(pattern: &str) -> bool {
+    !pattern.chars().any(char::is_uppercase)
+}
+
+/// Build the [`AtSearch`] for a typed query walked from `walk_base` and hand it to `answer`.
+/// An invalid regex answers `None` without it.
+pub(super) fn with_search(
+    typed: &TypedQuery<'_>,
+    walk_base: &Path,
+    cancel: &AtomicBool,
+    answer: impl FnOnce(&AtSearch<'_>) -> Option<Suggestions>,
+) -> Option<Suggestions> {
+    let (pattern, full_path_mode) = fd_pattern(typed.query);
     let regex = if pattern.is_empty() {
         None
     } else {
         Some(
             RegexBuilder::new(&pattern)
-                .case_insensitive(!pattern.chars().any(char::is_uppercase))
+                .case_insensitive(fd_case_insensitive(&pattern))
                 .build()
                 .ok()?,
         )
     };
-    let lower_query = query.to_lowercase();
+    let lower_query = typed.query.to_lowercase();
     let search = AtSearch {
         lower_query: &lower_query,
-        display_base: scoped_query
-            .as_ref()
-            .map(|scoped| scoped.display_base.as_str()),
-        at_prefix,
-        is_quoted_prefix,
-        walk_base: &walk_base,
+        display_base: typed.display_base,
+        at_prefix: typed.at_prefix,
+        is_quoted_prefix: typed.is_quoted_prefix,
+        walk_base,
         regex: regex.as_ref(),
         full_path_mode,
         cancel,
     };
-    let scope = match &scoped_query {
-        Some(scoped) => index_scope(&scoped.display_base),
-        None => IndexScope::Unscoped,
-    };
-    answer(&search, &scope)
+    answer(&search)
 }
 
 /// The typed scope as an index prefix: relative, no `..` component, a leading `./`

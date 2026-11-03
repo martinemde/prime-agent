@@ -557,6 +557,27 @@ pub enum DaemonCommand {
         #[serde(flatten)]
         rest: JsonMap,
     },
+    /// The `@` file-completion walk on the daemon's filesystem, for a client that does not share
+    /// it. Rust-native extension, advertised by the `file_search` capability. `scope` is the
+    /// typed directory (relative to `cwd`, absolute, or `~/`-prefixed); `pattern` is the fd-style
+    /// regex matched against each entry's name, or its root-joined path when `full_path`. The
+    /// response carries the walk `root` (`null` when the scope is not a directory) and up to 100
+    /// `entries` relative to it, directories with a trailing `/`.
+    SearchFiles {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+        #[serde(default)]
+        case_insensitive: bool,
+        #[serde(default)]
+        full_path: bool,
+        #[serde(flatten)]
+        rest: JsonMap,
+    },
     /// Every persistent `bash()` shell machine-wide with its assigned session id.
     /// Rust-native extension, advertised by the `persistent_shells` capability.
     ListPersistentShells {

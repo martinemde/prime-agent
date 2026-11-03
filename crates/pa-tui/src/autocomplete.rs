@@ -12,7 +12,9 @@ use pa_types::slash_commands::SlashCommandRegistry;
 
 mod file_index;
 mod fuzzy_file_search;
+mod remote_file_search;
 pub use fuzzy_file_search::FileSearch;
+pub use remote_file_search::RemoteFiles;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionItem {
@@ -741,6 +743,8 @@ pub struct CombinedAutocompleteProvider {
     paths: PathCompletionProvider,
     /// The `@` file search's in-memory file index (one per session view).
     file_index: file_index::FileIndex,
+    /// The daemon's filesystem, when it is not this one: `@` walks there instead.
+    remote_files: Option<RemoteFiles>,
 }
 
 impl CombinedAutocompleteProvider {
@@ -776,13 +780,21 @@ impl CombinedAutocompleteProvider {
             arguments: HashMap::default(),
             paths: PathCompletionProvider { base },
             file_index: file_index::FileIndex::new(),
+            remote_files: None,
         }
     }
 
+    /// Route `@` through a remote daemon's filesystem; `base` is a path there.
+    pub fn set_remote_files(&mut self, remote_files: RemoteFiles) {
+        self.remote_files = Some(remote_files);
+    }
+
     /// Start building the `@` file index in the background, so the first `@` query can
-    /// already answer from memory.
+    /// already answer from memory. A remote daemon's files are never indexed here.
     pub fn start_file_index(&self) {
-        self.file_index.start_build(&self.paths.base);
+        if self.remote_files.is_none() {
+            self.file_index.start_build(&self.paths.base);
+        }
     }
 
     /// Replace the hidden-command set (the caller recomputes model
@@ -904,6 +916,9 @@ impl AutocompleteProvider for CombinedAutocompleteProvider {
         let line: Vec<char> = lines.get(cursor_line)?.chars().collect();
         let before: Vec<char> = line[..cursor_col.min(line.len())].to_vec();
         if let Some(at_prefix) = extract_at_prefix(&before) {
+            if let Some(remote_files) = &self.remote_files {
+                return Some(remote_files.lookup(&self.paths.base, at_prefix));
+            }
             return fuzzy_file_search::lookup(&self.paths.base, &self.file_index, at_prefix);
         }
         if !force {

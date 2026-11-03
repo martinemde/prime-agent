@@ -48,6 +48,7 @@ pub mod auth;
 pub mod autonomous;
 pub mod cron;
 pub mod export_html;
+pub mod file_search;
 pub mod goals;
 pub mod kernel;
 pub mod mcp;

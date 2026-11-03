@@ -997,3 +997,87 @@ fn at_index_tracks_watcher_events() {
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
+
+/// A remote daemon walks `@` on its own disk: the provider sends the typed scope and fd
+/// pattern as `search_files` and ranks the daemon's entries; the base exists only there.
+#[cfg(unix)]
+#[test]
+fn at_search_walks_a_remote_daemons_files() {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let socket = dir.path().join("forwarded.sock");
+    let listener = runtime.block_on(async { tokio::net::UnixListener::bind(&socket) });
+    let listener = listener.expect("bind");
+    let (seen_tx, seen_rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    runtime.spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen_tx = seen_tx.clone();
+            tokio::spawn(async move {
+                let (reader, mut writer) = stream.into_split();
+                let hello = serde_json::json!({
+                    "type": "daemon_hello",
+                    "protocol": { "name": "prime-agent.daemon", "version": 7 },
+                    "socketPath": "/nonexistent/prime-agent/daemon.sock",
+                    "clientId": "srv",
+                    "serverCapabilities": ["file_search"],
+                });
+                writer
+                    .write_all(format!("{hello}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut lines = tokio::io::BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let envelope: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let command = envelope["command"].clone();
+                    let _ = seen_tx.send(command.clone());
+                    let response = serde_json::json!({
+                        "type": "response",
+                        "id": envelope["id"],
+                        "command": command["type"],
+                        "success": true,
+                        "data": {
+                            "root": "/srv/repo/src",
+                            "entries": ["deep/", "deep/partial_match.rs", "other.md"],
+                        },
+                    });
+                    writer
+                        .write_all(format!("{response}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+            });
+        }
+    });
+    let (client, _events) = runtime
+        .block_on(crate::daemon_client::DaemonClient::connect(&socket))
+        .expect("connect");
+    let remote_files = {
+        let _entered = runtime.enter();
+        RemoteFiles::for_client(&client).expect("a remote daemon serving file_search")
+    };
+    let mut provider = provider("/srv/repo");
+    provider.set_remote_files(remote_files);
+    let values: Vec<String> = at_values(&provider, "see @src/par")
+        .into_iter()
+        .map(|item| item.value)
+        .collect();
+    assert_eq!(values, ["@src/deep/partial_match.rs"]);
+    assert_eq!(
+        seen_rx.recv().expect("the search request"),
+        serde_json::json!({
+            "type": "search_files",
+            "cwd": "/srv/repo",
+            "scope": "src/",
+            "pattern": "par",
+            "caseInsensitive": true,
+            "fullPath": false,
+        })
+    );
+}

@@ -168,6 +168,7 @@ pub const KNOWN_COMMAND_TYPES: &[&str] = &[
     "list_persistent_shells",
     "tail_persistent_shell",
     "kill_persistent_shell",
+    "search_files",
     "get_session_messages",
 ];
 
@@ -341,6 +342,7 @@ pub fn default_server_capabilities() -> Vec<DaemonServerCapability> {
                 "transient_bash",
                 "kernel_bash_activity",
                 "persistent_shells",
+                "file_search",
                 "factory_activity",
                 "session_input_admission",
                 "prompt_admission_cancellation",
@@ -937,6 +939,7 @@ pub fn command_active_session_id(command: &DaemonCommand) -> Option<&str> {
         | DaemonCommand::ListPersistentShells { .. }
         | DaemonCommand::TailPersistentShell { .. }
         | DaemonCommand::KillPersistentShell { .. }
+        | DaemonCommand::SearchFiles { .. }
         | DaemonCommand::Restart { .. }
         | DaemonCommand::Shutdown { .. } => None,
     }
@@ -986,6 +989,7 @@ pub fn command_type_name(command: &DaemonCommand) -> &'static str {
         DaemonCommand::TailKernelBash { .. } => "tail_kernel_bash",
         DaemonCommand::KillKernelBash { .. } => "kill_kernel_bash",
         DaemonCommand::ListPersistentShells { .. } => "list_persistent_shells",
+        DaemonCommand::SearchFiles { .. } => "search_files",
         DaemonCommand::TailPersistentShell { .. } => "tail_persistent_shell",
         DaemonCommand::KillPersistentShell { .. } => "kill_persistent_shell",
         DaemonCommand::CancelRlmChild { .. } => "cancel_rlm_child",

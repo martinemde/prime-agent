@@ -240,8 +240,11 @@ async fn run_interactive_surface(
     view.code_block_indent = options.code_block_indent.clone();
     // The file-completion provider browses the SESSION cwd, not the process cwd: the completion
     // menu must browse the directory the user sees.
-    let provider =
+    let mut provider =
         crate::autocomplete::CombinedAutocompleteProvider::from_registry(options.cwd.clone());
+    if let Some(remote_files) = crate::autocomplete::RemoteFiles::for_client(&client) {
+        provider.set_remote_files(remote_files);
+    }
     provider.start_file_index();
     view.editor.set_autocomplete_provider(Box::new(provider));
     view.editor.set_keybindings(options.keybindings.clone());

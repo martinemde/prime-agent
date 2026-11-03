@@ -46,6 +46,7 @@ pub(crate) mod create_reuse;
 pub mod descriptor;
 pub mod engine;
 pub(crate) mod factory_activity;
+pub(crate) mod file_search;
 pub mod framing;
 mod goal_continuation;
 pub(crate) mod goal_state_persist;
