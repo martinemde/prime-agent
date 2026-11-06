@@ -99,6 +99,10 @@ fn assemble_breakdown(
         .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>();
     let (skill_overrides, generic_servers, _manager) =
         pa_core::mcp::McpManager::prompt_gating(user_servers, &agent_dir);
+    let python_requirements =
+        pa_core::kernel::bootstrap::KernelStartupScripts::discover(&agent_dir)
+            .requirements()
+            .requirements;
     let resources = load_resources(ResourceLoaderOptions {
         extra_builtin_skill_overrides: skill_overrides,
         system_prompt: None,
@@ -123,6 +127,7 @@ fn assemble_breakdown(
             generic_mcp_servers: generic_servers,
             rlm_depth: Some(0),
             model_prompt_extras: model_prompts.extras.as_deref(),
+            python_requirements: Some(python_requirements),
             ..Default::default()
         },
     );

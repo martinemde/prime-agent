@@ -10,10 +10,7 @@ use std::sync::Mutex;
 use anyhow::{anyhow, Context};
 use sha2::Digest;
 
-use super::{
-    default_rlm_extra_uv_args, EnsureKernelPythonOptions, KernelPythonSkill,
-    DEFAULT_RLM_EXTRA_PACKAGES,
-};
+use super::{EnsureKernelPythonOptions, KernelPythonSkill};
 
 // The concern children (the flows + the shared record stay in the
 // composition root).
@@ -35,7 +32,7 @@ use probe::{installed_rlm_dir, lock_probe_memo, runtime_probe_key};
 #[cfg(all(test, unix))]
 use probe::{clear_in_process_probe_memo_for_tests, installed_package_dir};
 pub(crate) use probe::{
-    has_prime_agent_runtime, missing_python_skill_import_labels, missing_rlm_extra_import_labels,
+    has_prime_agent_runtime, missing_python_requirements, missing_python_skill_import_labels,
 };
 use probe::{has_prime_agent_runtime_memoized, installed_runtime_identity};
 use runtime_source::collect_python_files;
@@ -51,8 +48,8 @@ pub(crate) use uv::ensure_uv;
 use uv::windows_executable_candidates;
 use version::{
     bootstrap_base_version_current, bootstrap_skill_key, bootstrap_version_current,
-    read_bootstrap_version, read_bootstrap_version_raw, write_bootstrap_version,
-    STATE_SNAPSHOT_REQUIREMENT,
+    read_bootstrap_version, read_bootstrap_version_raw, record_python_requirements,
+    write_bootstrap_version, STATE_SNAPSHOT_REQUIREMENT,
 };
 #[cfg(test)]
 use version::{recorded_skills_cover, BOOTSTRAP_SCHEMA};
@@ -111,6 +108,7 @@ pub(crate) async fn bootstrap_venv(
     source_dir: &Path,
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
+    requirements: &[String],
     options: &EnsureKernelPythonOptions,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(venv.parent().unwrap_or(Path::new("/")))?;
@@ -127,9 +125,6 @@ pub(crate) async fn bootstrap_venv(
         source_dir.to_string_lossy().to_string(),
     ];
     install_args.push(STATE_SNAPSHOT_REQUIREMENT.to_string());
-    for uv_arg in default_rlm_extra_uv_args() {
-        install_args.push(uv_arg.to_string());
-    }
 
     run_async(
         &uv,
@@ -151,7 +146,22 @@ pub(crate) async fn bootstrap_venv(
         ],
     )
     .await?;
-    run_async(&uv, &install_args).await?;
+    // One resolve installs the runtime with the startup scripts' packages. A
+    // package that fails to resolve must not cost the kernel its runtime: fall
+    // back to the runtime alone and leave the packages unrecorded.
+    let mut with_requirements = install_args.clone();
+    with_requirements.extend(requirements.iter().cloned());
+    let installed_requirements = match run_async(&uv, &with_requirements).await {
+        Ok(()) => requirements,
+        Err(error) if !requirements.is_empty() => {
+            run_async(&uv, &install_args).await?;
+            options.report(&format!(
+                "Warning: Python packages from system.py/user.py failed to install: {error}"
+            ));
+            &[]
+        }
+        Err(error) => return Err(error),
+    };
     sync_python_skills(
         &uv,
         venv,
@@ -161,7 +171,60 @@ pub(crate) async fn bootstrap_venv(
         python_skills,
         options,
     )
-    .await
+    .await?;
+    record_python_requirements(venv, installed_requirements)
+}
+
+/// True when the version file records every one of `requirements` as installed.
+pub(crate) fn requirements_recorded(venv: &Path, requirements: &[String]) -> bool {
+    let recorded = read_bootstrap_version(venv)
+        .and_then(|version| version.extra_uv_args)
+        .unwrap_or_default();
+    requirements
+        .iter()
+        .all(|requirement| recorded.contains(requirement))
+}
+
+/// Install the startup scripts' packages the version file does not record yet, in one resolve.
+/// A failure warns and leaves them unrecorded, so the next start retries.
+pub(crate) async fn sync_python_requirements(
+    uv: &str,
+    venv: &Path,
+    python: &Path,
+    source_dir: &Path,
+    requirements: &[String],
+    options: &EnsureKernelPythonOptions,
+) -> anyhow::Result<()> {
+    let recorded = read_bootstrap_version(venv)
+        .and_then(|version| version.extra_uv_args)
+        .unwrap_or_default();
+    let missing: Vec<String> = requirements
+        .iter()
+        .filter(|requirement| !recorded.contains(requirement))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut install_args = vec![
+        "pip".to_string(),
+        "install".to_string(),
+        "--python".to_string(),
+        python.to_string_lossy().to_string(),
+        // Keep the resolver pinned to the local runtime source.
+        source_dir.to_string_lossy().to_string(),
+    ];
+    install_args.extend(missing.iter().cloned());
+    match run_async(uv, &install_args).await {
+        Ok(()) => record_python_requirements(venv, &missing),
+        Err(error) => {
+            options.report(&format!(
+                "Warning: Python packages from system.py/user.py failed to install ({}): {error}",
+                missing.join(", ")
+            ));
+            Ok(())
+        }
+    }
 }
 
 /// Install/refresh the editable Python skills recorded in the version file. Only skills missing or

@@ -66,6 +66,13 @@ Prime Agent combines a persistent Python control environment with durable harnes
 - **Agents communicate directly:** running agents can exchange messages and orchestrate one another without routing everything through the user.
 - **Long tasks keep moving:** automatic compaction, persistent goals, heartbeats, schedules, autonomous mode, and retained subagents preserve progress across turns and terminal sessions.
 
+## Python startup scripts
+
+The Python REPL's starting state is configured in Python. Add a `user.py` to `~/.prime/agent/` to
+import, define, or install anything the agent should have at every kernel start, or replace the
+shipped `system.py` there. PEP 723 `dependencies` in either file are pre-installed in the kernel
+venv. See the [Python startup scripts guide](docs/python-startup.md).
+
 ## Slack
 
 Connect Slack from `/mcp` or run `/mcp login slack` inside Prime Agent to search

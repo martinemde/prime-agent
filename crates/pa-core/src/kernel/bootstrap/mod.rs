@@ -1,11 +1,13 @@
 //! Kernel Python environment bootstrap: the public entry point [`ensure_kernel_python`]
 //! resolves (and on first run builds) the venv that runs `python -m rlm.repl`,
 //! deduplicating concurrent bootstraps; the venv and version-file machinery lives in
-//! [`venv`], the runtime bootstrap code in [`runtime_code`].
+//! [`venv`], the runtime bootstrap code in [`runtime_code`], and the agent dir's
+//! `system.py`/`user.py` startup scripts in [`startup_scripts`].
 
 pub(crate) mod dir_lock;
 mod disk_memo;
 mod runtime_code;
+mod startup_scripts;
 pub(crate) mod venv;
 
 use std::fmt::Write as _;
@@ -16,13 +18,16 @@ use anyhow::{anyhow, Context};
 
 use dir_lock::acquire_bootstrap_lock;
 pub use runtime_code::{
-    build_rlm_bootstrap_code, parse_unavailable_python_skills, UnavailablePythonSkills,
-    PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
+    build_kernel_bootstrap_code, build_rlm_bootstrap_code, parse_unavailable_python_skills,
+    UnavailablePythonSkills, PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
 };
+pub(crate) use startup_scripts::{requirement_name, KERNEL_AGENT_DIR_ENV};
+pub use startup_scripts::{KernelStartupScripts, StartupRequirements, StartupScript};
 use venv::{
-    bootstrap_venv, ensure_uv, expand_home, has_prime_agent_runtime,
-    missing_python_skill_import_labels, missing_rlm_extra_import_labels, normalize_python_skills,
-    resolve_writable_kernel_venv_dir, sync_python_skills, BootstrapPythonSkill,
+    bootstrap_venv, ensure_uv, expand_home, has_prime_agent_runtime, missing_python_requirements,
+    missing_python_skill_import_labels, normalize_python_skills, requirements_recorded,
+    resolve_writable_kernel_venv_dir, sync_python_requirements, sync_python_skills,
+    BootstrapPythonSkill,
 };
 pub use venv::{invalidate_runtime_probe_cache, kernel_venv_dir, kernel_venv_python};
 use venv::{kernel_base_ready, kernel_ready};
@@ -36,54 +41,14 @@ pub struct KernelPythonSkill {
     pub pyproject_path: PathBuf,
 }
 
-/// The default extra packages pre-installed in the kernel venv and promised to
-/// the model in the system prompt.
-pub const DEFAULT_RLM_EXTRA_PACKAGES: [(&str, &str, &str); 12] = [
-    // (uvArg, importName, promptLabel)
-    ("requests", "requests", "requests"),
-    ("httpx", "httpx", "httpx"),
-    ("pyyaml", "yaml", "yaml (PyYAML)"),
-    ("tomli", "tomli", "tomli"),
-    ("python-dotenv", "dotenv", "dotenv (python-dotenv)"),
-    ("pandas", "pandas", "pandas"),
-    ("numpy", "numpy", "numpy"),
-    ("scipy", "scipy", "scipy"),
-    ("beautifulsoup4", "bs4", "bs4 (Beautiful Soup)"),
-    ("lxml", "lxml", "lxml"),
-    ("pydantic", "pydantic", "pydantic"),
-    ("tyro", "tyro", "tyro"),
-];
-
-#[must_use]
-pub fn default_rlm_extra_uv_args() -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(uv, _, _)| *uv)
-        .collect()
-}
-
-#[must_use]
-pub fn default_rlm_extra_import_names() -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(_, import, _)| *import)
-        .collect()
-}
-
-#[must_use]
-pub fn default_rlm_extra_import_labels() -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
-        .iter()
-        .map(|(_, _, label)| *label)
-        .collect()
-}
-
 /// Progress callback for the bootstrap (`ensure_kernel_python`).
 pub type KernelBootstrapProgressHandler = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Default)]
 pub struct EnsureKernelPythonOptions {
     pub python_skills: Vec<KernelPythonSkill>,
+    /// The startup scripts whose PEP 723 dependencies the venv pre-installs.
+    pub startup: KernelStartupScripts,
     pub on_progress: Option<KernelBootstrapProgressHandler>,
 }
 
@@ -135,12 +100,18 @@ static IN_FLIGHT: Mutex<InFlightBootstrap> = Mutex::new(None);
 /// The in-flight promise stores its outcome under the same lock, so the `expect` is unreachable.
 pub async fn ensure_kernel_python(options: EnsureKernelPythonOptions) -> anyhow::Result<PathBuf> {
     let python_skills = normalize_python_skills(&options.python_skills);
+    let requirements = options.startup.requirements();
+    for error in &requirements.errors {
+        options.report(&format!("Warning: {error}"));
+    }
+    let requirements = requirements.requirements;
     let key = [
         std::env::var("PRIME_AGENT_KERNEL_PYTHON").unwrap_or_default(),
         std::env::var("PRIME_AGENT_KERNEL_VENV").unwrap_or_default(),
         std::env::var("HOME").unwrap_or_default(),
         std::env::var("XDG_DATA_HOME").unwrap_or_default(),
         serde_json::to_string(&python_skills).unwrap_or_default(),
+        serde_json::to_string(&requirements).unwrap_or_default(),
     ]
     .join("\u{0}");
 
@@ -159,7 +130,7 @@ pub async fn ensure_kernel_python(options: EnsureKernelPythonOptions) -> anyhow:
     };
     let mut guard = shared.lock().await;
     if guard.is_none() {
-        *guard = Some(ensure_kernel_python_uncached(&options, &python_skills).await);
+        *guard = Some(ensure_kernel_python_uncached(&options, &python_skills, &requirements).await);
     }
     let outcome = guard.take().expect("outcome was just stored");
     // Drop the registry entry so a later call re-validates instead of reusing
@@ -176,6 +147,7 @@ pub async fn ensure_kernel_python(options: EnsureKernelPythonOptions) -> anyhow:
 async fn ensure_kernel_python_uncached(
     options: &EnsureKernelPythonOptions,
     python_skills: &[BootstrapPythonSkill],
+    requirements: &[String],
 ) -> anyhow::Result<PathBuf> {
     if let Ok(override_python) = std::env::var("PRIME_AGENT_KERNEL_PYTHON") {
         if !override_python.is_empty() {
@@ -188,10 +160,10 @@ async fn ensure_kernel_python_uncached(
                 );
             }
             if missing.is_empty() {
-                let missing_extras = missing_rlm_extra_import_labels(&python_str);
+                let missing_extras = missing_python_requirements(&python_str, requirements);
                 if !missing_extras.is_empty() {
                     missing.push(format!(
-                        "default Python packages ({})",
+                        "the Python packages system.py/user.py declare ({})",
                         missing_extras.join(", ")
                     ));
                 }
@@ -218,12 +190,13 @@ async fn ensure_kernel_python_uncached(
     }
 
     let venv = resolve_writable_kernel_venv_dir()?;
-    ensure_kernel_venv(options, python_skills, venv).await
+    ensure_kernel_venv(options, python_skills, requirements, venv).await
 }
 
 async fn ensure_kernel_venv(
     options: &EnsureKernelPythonOptions,
     python_skills: &[BootstrapPythonSkill],
+    requirements: &[String],
     venv: PathBuf,
 ) -> anyhow::Result<PathBuf> {
     let python = kernel_venv_python(&venv);
@@ -234,19 +207,30 @@ async fn ensure_kernel_venv(
         venv::require_runtime_source_dir().map_err(|error| format_bootstrap_failure(&error))?;
     let runtime_identity =
         venv::hash_runtime_source(&source_dir).map_err(|error| format_bootstrap_failure(&error))?;
-    if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
+    let ready = || {
+        kernel_ready(&python_str, &venv, &runtime_identity, python_skills)
+            && requirements_recorded(&venv, requirements)
+    };
+    if ready() {
         return Ok(python);
     }
 
     let release_lock = match acquire_bootstrap_lock(&venv).await {
         Ok(release_lock) => release_lock,
         Err(error) if dir_lock::lock_creation_denied(&error) => {
-            return unwritable_venv(options, &python, &venv, &runtime_identity, &error);
+            return unwritable_venv(
+                options,
+                &python,
+                &venv,
+                &runtime_identity,
+                requirements,
+                &error,
+            );
         }
         Err(error) => return Err(error),
     };
     let result = async {
-        if kernel_ready(&python_str, &venv, &runtime_identity, python_skills) {
+        if ready() {
             return Ok(python);
         }
         if kernel_base_ready(&python_str, &venv, &runtime_identity) {
@@ -261,6 +245,8 @@ async fn ensure_kernel_venv(
                 options,
             )
             .await?;
+            sync_python_requirements(&uv, &venv, &python, &source_dir, requirements, options)
+                .await?;
             return Ok(python);
         }
         let had_venv = venv.exists();
@@ -275,6 +261,7 @@ async fn ensure_kernel_venv(
             &source_dir,
             &runtime_identity,
             python_skills,
+            requirements,
             options,
         )
         .await?;
@@ -295,6 +282,7 @@ fn unwritable_venv(
     python: &std::path::Path,
     venv: &std::path::Path,
     runtime_identity: &str,
+    requirements: &[String],
     lock_error: &anyhow::Error,
 ) -> anyhow::Result<PathBuf> {
     let python_str = python.to_string_lossy().to_string();
@@ -313,6 +301,13 @@ fn unwritable_venv(
             "Warning: Python skills unavailable in {} and will be disabled: {}",
             venv.display(),
             missing.join(", ")
+        ));
+    }
+    if !requirements_recorded(venv, requirements) {
+        options.report(&format!(
+            "Warning: Python packages from system.py/user.py may be missing from {}, which is not writable: {}",
+            venv.display(),
+            requirements.join(", ")
         ));
     }
     Ok(python.to_path_buf())
@@ -341,7 +336,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             std::time::Duration::from_secs(121),
-            ensure_kernel_venv(&options, &[], venv),
+            ensure_kernel_venv(&options, &[], &[], venv),
         )
         .await
         .expect("lock acquisition must have a bounded wait")
