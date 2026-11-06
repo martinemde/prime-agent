@@ -3,7 +3,6 @@
 
 use super::{
     collect_python_files, Digest, HashMap, KernelPythonSkill, Mutex, Path, PathBuf, Stdio,
-    DEFAULT_RLM_EXTRA_PACKAGES,
 };
 
 fn python_imports(python: &str, module_name: &str) -> bool {
@@ -34,11 +33,41 @@ pub(crate) fn has_prime_agent_runtime(python: &str) -> bool {
     run_quiet(python, &["-c", RUNTIME_READY_CHECK])
 }
 
-pub(crate) fn missing_rlm_extra_import_labels(python: &str) -> Vec<&'static str> {
-    DEFAULT_RLM_EXTRA_PACKAGES
+/// Prints each argv distribution name the interpreter has no installed distribution for.
+const MISSING_DISTRIBUTIONS_CHECK: &str = "import sys, importlib.metadata as m\nfor n in sys.argv[1:]:\n    try:\n        m.distribution(n)\n    except m.PackageNotFoundError:\n        print(n)";
+
+/// The startup-script requirements whose distributions `python` lacks, all
+/// of them when the probe cannot run.
+pub(crate) fn missing_python_requirements(python: &str, requirements: &[String]) -> Vec<String> {
+    if requirements.is_empty() {
+        return Vec::new();
+    }
+    let names: Vec<&str> = requirements
         .iter()
-        .filter(|(_, import, _)| !python_imports(python, import))
-        .map(|(_, _, label)| *label)
+        .map(|requirement| crate::kernel::bootstrap::requirement_name(requirement))
+        .collect();
+    let mut child = std::process::Command::new(python);
+    child
+        .args(["-c", MISSING_DISTRIBUTIONS_CHECK])
+        .args(&names)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    crate::platform::process::set_no_window(&mut child);
+    if cfg!(windows) {
+        child.env("PYTHONUTF8", "1");
+    }
+    let missing_names: Vec<String> = match child.output() {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect(),
+        _ => return requirements.to_vec(),
+    };
+    requirements
+        .iter()
+        .zip(names)
+        .filter(|(_, name)| missing_names.iter().any(|missing| missing == name))
+        .map(|(requirement, _)| requirement.clone())
         .collect()
 }
 

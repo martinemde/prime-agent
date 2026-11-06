@@ -114,6 +114,9 @@ impl Inner {
         let python = crate::kernel::bootstrap::ensure_kernel_python(
             crate::kernel::bootstrap::EnsureKernelPythonOptions {
                 python_skills: skills,
+                startup: crate::kernel::bootstrap::KernelStartupScripts::from_kernel_env(
+                    &self.options.env,
+                ),
                 on_progress: progress,
             },
         )

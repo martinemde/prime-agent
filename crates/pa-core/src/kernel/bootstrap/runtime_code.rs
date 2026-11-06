@@ -1,7 +1,8 @@
 //! The runtime bootstrap code injected into each kernel right after start or
-//! restore: binds the `rlm`, `bash`, and MCP surfaces and pre-imports every
-//! Python skill.
+//! restore: runs the system setup (which binds the `rlm`, `bash`, and MCP
+//! surfaces), pre-imports every Python skill, then runs the user setup.
 
+use super::startup_scripts::{KernelStartupScripts, StartupScript, SHIPPED_SYSTEM_SCRIPT};
 use super::KernelPythonSkill;
 
 /// Line the runtime bootstrap prints when one or more pre-imported Python skills failed to import.
@@ -30,73 +31,87 @@ pub fn parse_unavailable_python_skills(stdout: &str) -> Option<UnavailablePython
     (!errors.is_empty()).then_some(errors)
 }
 
-const RLM_BOOTSTRAP_HEADER_CODE: &str =
-    "import asyncio\nimport os as _prime_agent_os\n\n_prime_agent_os.environ[\"NO_COLOR\"] = \"1\"";
-
-const RLM_BOOTSTRAP_RUNTIME_HEAD_CODE: &str = "
-try:
+/// Host wiring the runtime needs whatever the system setup does, emitted only
+/// when the host registered the [`crate::kernel::shared::BASH_COMPLETED_REQUEST_TYPE`]
+/// handler: turns the runtime's bounded `await bash()` on. Without the notice
+/// nothing wakes a cell that ended its turn on a degraded command, so
+/// daemonless sessions keep the unbounded await.
+const RLM_BOOTSTRAP_BASH_NOTICES_CODE: &str = "try:
     import rlm as _prime_agent_rlm_module
-    rlm = _prime_agent_rlm_module.rlm
-    bash = _prime_agent_rlm_module.bash
-    import rlm.mcp as mcp
-";
+    _prime_agent_rlm_module._set_completion_notices_wired(True)
+except Exception:
+    pass";
 
-/// One line inside the bootstrap's try block, emitted only when the host
-/// registered the [`crate::kernel::shared::BASH_COMPLETED_REQUEST_TYPE`]
-/// handler: turns the runtime's bounded `await bash()` on. Without
-/// the notice nothing wakes a cell that ended its turn on a degraded command,
-/// so daemonless sessions keep the unbounded await.
-const RLM_BOOTSTRAP_BASH_NOTICES_LINE_CODE: &str =
-    "    _prime_agent_rlm_module._set_completion_notices_wired(True)\n";
+/// Runs one startup script from the agent dir in the REPL namespace, the way
+/// the interpreter runs `PYTHONSTARTUP`: top-level `await` works as in a cell,
+/// and an exception prints its traceback to stderr instead of failing the
+/// kernel (like a broken `sitecustomize`).
+const RUN_STARTUP_SCRIPT_CODE: &str = r#"async def _prime_agent_run_startup_script(_prime_agent_path, _prime_agent_source):
+    import ast as _prime_agent_ast
+    import inspect as _prime_agent_inspect
+    import sys as _prime_agent_sys
+    import traceback as _prime_agent_traceback
+    try:
+        _prime_agent_result = eval(
+            compile(
+                _prime_agent_source,
+                _prime_agent_path,
+                "exec",
+                flags=_prime_agent_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
+            ),
+            globals(),
+        )
+        if _prime_agent_inspect.iscoroutine(_prime_agent_result):
+            await _prime_agent_result
+    except Exception:
+        print(f"Error in {_prime_agent_path}:", file=_prime_agent_sys.stderr)
+        _prime_agent_traceback.print_exc()"#;
 
-const RLM_BOOTSTRAP_RUNTIME_TAIL_CODE: &str = r#"
-except Exception as _prime_agent_rlm_error:
-    _PRIME_AGENT_RLM_IMPORT_ERROR = str(_prime_agent_rlm_error)
+fn run_startup_script_line(script: &StartupScript) -> String {
+    let path = script.path.display().to_string();
+    // JSON string literals are valid Python string literals.
+    let path_literal = serde_json::to_string(&path).unwrap_or_else(|_| "\"\"".to_string());
+    let source_literal =
+        serde_json::to_string(&script.source).unwrap_or_else(|_| "\"\"".to_string());
+    format!("await _prime_agent_run_startup_script({path_literal}, {source_literal})")
+}
 
-    class _PrimeAgentMissingRlm:
-        def _raise_missing(self):
-            raise RuntimeError(
-                "prime-agent-runtime is not installed in this kernel. "
-                "Remove ~/.prime/agent/kernel-venv so prime-agent can rebuild it, or set "
-                "PRIME_AGENT_KERNEL_PYTHON to a kernel environment with prime-agent-runtime installed. "
-                f"Import error: {_PRIME_AGENT_RLM_IMPORT_ERROR}"
-            )
-
-        async def spawn(self, prompt, **kwargs):
-            self._raise_missing()
-
-        async def find_models(self, query="", limit=8):
-            self._raise_missing()
-
-        async def create_session(self, prompt, **kwargs):
-            self._raise_missing()
-
-        async def list_subagents(self):
-            self._raise_missing()
-
-        async def delete_subagent(self, target):
-            self._raise_missing()
-
-    rlm = _PrimeAgentMissingRlm()
-
-    def bash(command, persistent=False):
-        rlm._raise_missing()
-"#;
-
-/// The code the session injects right after kernel start/restore: binds the `rlm`, `bash`, and MCP
-/// surfaces, imports every Python skill. `bash_notices_wired` emits the bounded-await toggle only
-/// when the host registers the bash completion notice.
+/// The code the session injects right after kernel start/restore, with the shipped system setup
+/// and no user script. See [`build_kernel_bootstrap_code`].
 #[must_use]
 pub fn build_rlm_bootstrap_code(
     python_skills: &[KernelPythonSkill],
     bash_notices_wired: bool,
 ) -> String {
-    let mut runtime_code = String::from(RLM_BOOTSTRAP_RUNTIME_HEAD_CODE);
+    build_kernel_bootstrap_code(
+        &KernelStartupScripts::default(),
+        python_skills,
+        bash_notices_wired,
+    )
+}
+
+/// The code the session injects right after kernel start/restore, in order: the host's bash
+/// notice wiring (only when `bash_notices_wired`), the system setup (the agent dir's `system.py`,
+/// else the shipped one, which binds the `rlm`, `bash`, and MCP surfaces), every Python skill
+/// import, then the agent dir's `user.py`.
+#[must_use]
+pub fn build_kernel_bootstrap_code(
+    startup: &KernelStartupScripts,
+    python_skills: &[KernelPythonSkill],
+    bash_notices_wired: bool,
+) -> String {
+    let mut sections: Vec<String> = Vec::new();
     if bash_notices_wired {
-        runtime_code.push_str(RLM_BOOTSTRAP_BASH_NOTICES_LINE_CODE);
+        sections.push(RLM_BOOTSTRAP_BASH_NOTICES_CODE.to_string());
     }
-    runtime_code.push_str(RLM_BOOTSTRAP_RUNTIME_TAIL_CODE);
-    let base_code = format!("{RLM_BOOTSTRAP_HEADER_CODE}\n\n{runtime_code}");
+    if startup.system.is_some() || startup.user.is_some() {
+        sections.push(RUN_STARTUP_SCRIPT_CODE.to_string());
+    }
+    match &startup.system {
+        Some(script) => sections.push(run_startup_script_line(script)),
+        None => sections.push(SHIPPED_SYSTEM_SCRIPT.trim().to_string()),
+    }
+    // Python skills pre-import between the system and user setup.
     // TS: `[...new Set(pythonSkills.map(...))]` — first-seen order, so the pre-import loop follows
     // the session's skill discovery order.
     let mut import_names: Vec<&str> = Vec::new();
@@ -106,14 +121,11 @@ pub fn build_rlm_bootstrap_code(
             import_names.push(import_name);
         }
     }
-    if import_names.is_empty() {
-        return base_code;
-    }
-    let imports_json = serde_json::to_string(&import_names).unwrap_or_else(|_| "[]".to_string());
-    format!(
-        r#"
-{base_code}
-
+    if !import_names.is_empty() {
+        let imports_json =
+            serde_json::to_string(&import_names).unwrap_or_else(|_| "[]".to_string());
+        let code = format!(
+            r#"
 import importlib as _prime_agent_importlib
 import inspect as _prime_agent_inspect
 import sys as _prime_agent_sys
@@ -188,9 +200,13 @@ if _PRIME_AGENT_SKILL_IMPORT_ERRORS:
         + _prime_agent_json.dumps(_PRIME_AGENT_SKILL_IMPORT_ERRORS)
     )
 "#
-    )
-    .trim()
-    .to_string()
+        );
+        sections.push(code.trim().to_string());
+    }
+    if let Some(script) = &startup.user {
+        sections.push(run_startup_script_line(script));
+    }
+    sections.join("\n\n")
 }
 
 #[cfg(test)]
@@ -230,6 +246,40 @@ mod tests {
         let code = build_rlm_bootstrap_code(&skills, false);
         assert!(code.contains(r#"for _prime_agent_skill_name in ["edit"]"#));
         assert!(code.contains("_PrimeAgentUnavailableSkill"));
+    }
+
+    #[test]
+    fn bootstrap_code_runs_system_then_skills_then_user() {
+        let skills = vec![KernelPythonSkill {
+            name: "edit".into(),
+            import_name: "edit".into(),
+            package_path: PathBuf::from("/pkg/edit"),
+            pyproject_path: PathBuf::from("/pkg/edit/pyproject.toml"),
+        }];
+        let script = |name: &str, source: &str| StartupScript {
+            path: PathBuf::from(format!("/agent/{name}")),
+            source: source.to_string(),
+        };
+        let startup = KernelStartupScripts {
+            system: Some(script("system.py", "x = \"system\"\n")),
+            user: Some(script("user.py", "y = x\n")),
+        };
+        let code = build_kernel_bootstrap_code(&startup, &skills, true);
+        let at = |needle: &str| {
+            code.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}: {code}"))
+        };
+        let order = [
+            at("_set_completion_notices_wired(True)"),
+            at(r#"await _prime_agent_run_startup_script("/agent/system.py", "x = \"system\"\n")"#),
+            at(r#"for _prime_agent_skill_name in ["edit"]"#),
+            at(r#"await _prime_agent_run_startup_script("/agent/user.py", "y = x\n")"#),
+        ];
+        assert!(order.is_sorted(), "{code}");
+        assert!(
+            !code.contains("import rlm.mcp as mcp"),
+            "a system.py replaces the shipped setup: {code}"
+        );
     }
 
     /// The TS #2381 parser table: marker+JSON, noise-prefixed marker, no marker, non-JSON payload

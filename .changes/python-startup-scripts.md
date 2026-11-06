@@ -1,0 +1,1 @@
+- The Python kernel's starting state now comes from Python startup scripts: put a `user.py` in `~/.prime/agent/` to extend it or a `system.py` to replace it, and declare pre-installed packages with PEP 723 `dependencies`.

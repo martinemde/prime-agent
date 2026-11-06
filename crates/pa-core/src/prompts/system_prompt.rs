@@ -99,6 +99,9 @@ pub struct BuildSystemPromptOptions<'a> {
     pub can_spawn: bool,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
+    /// The kernel's pre-installed packages, from the agent dir's startup
+    /// scripts; `None` lists the shipped `system.py` packages.
+    pub python_requirements: Option<Vec<String>>,
 }
 
 /// Build the system prompt (assembled text only).
@@ -164,8 +167,12 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
 
     segments.push(PromptSegment::dynamic_segment(
         "packages",
-        "kernel bootstrap defaults",
-        packages_section(),
+        "kernel startup scripts (system.py, user.py)",
+        packages_section(&options.python_requirements.clone().unwrap_or_else(|| {
+            crate::kernel::bootstrap::KernelStartupScripts::default()
+                .requirements()
+                .requirements
+        })),
     ));
 
     let context = context_files_section(&options.context_files);
@@ -239,11 +246,26 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     }
 }
 
-fn packages_section() -> String {
-    use crate::kernel::bootstrap::default_rlm_extra_import_labels;
+/// How the prompt names a pre-installed package: the requirement's distribution name, with the
+/// import name first where the two differ for a shipped default.
+fn package_label(requirement: &str) -> String {
+    let name = crate::kernel::bootstrap::requirement_name(requirement);
+    match name.to_ascii_lowercase().as_str() {
+        "pyyaml" => "yaml (PyYAML)".to_string(),
+        "python-dotenv" => "dotenv (python-dotenv)".to_string(),
+        "beautifulsoup4" => "bs4 (Beautiful Soup)".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn packages_section(requirements: &[String]) -> String {
+    let labels: Vec<String> = requirements
+        .iter()
+        .map(|requirement| package_label(requirement))
+        .collect();
     let mut lines = vec![format!(
         "Pre-installed Python packages: {}.",
-        default_rlm_extra_import_labels().join(", ")
+        labels.join(", ")
     )];
     lines.push(
         "Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module)."
