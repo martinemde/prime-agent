@@ -1,6 +1,6 @@
 //! The version-file concern: the schema consts, the `.bootstrap-version` read/write.
 
-use super::{default_rlm_extra_uv_args, BootstrapPythonSkill, BootstrapVersion, Path};
+use super::{BootstrapPythonSkill, BootstrapVersion, Path};
 
 /// Schema of `.bootstrap-version`; a mismatch rebuilds the venv.
 pub(super) const BOOTSTRAP_SCHEMA: u64 = 9;
@@ -10,13 +10,6 @@ pub(super) fn read_bootstrap_version(venv: &Path) -> Option<BootstrapVersion> {
     let raw = std::fs::read_to_string(venv.join(BOOTSTRAP_VERSION_FILE)).ok()?;
     let parsed: BootstrapVersion = serde_json::from_str(&raw).ok()?;
     (parsed.schema > 0).then_some(parsed)
-}
-
-fn extra_uv_args_match(a: Option<&[String]>, b: &[&str]) -> bool {
-    match a {
-        None => false,
-        Some(a) => a.iter().map(String::as_str).eq(b.iter().copied()),
-    }
 }
 
 /// Identity of one recorded skill: the install root is the package path, and
@@ -55,10 +48,6 @@ pub(super) fn bootstrap_base_version_current(
             version.schema == BOOTSTRAP_SCHEMA
                 && version.runtime.as_deref() == Some(runtime_identity)
                 && version.snapshot.as_deref() == Some(STATE_SNAPSHOT_REQUIREMENT)
-                && extra_uv_args_match(
-                    version.extra_uv_args.as_deref(),
-                    &default_rlm_extra_uv_args(),
-                )
         }
         None => false,
     }
@@ -75,26 +64,48 @@ pub(super) fn bootstrap_version_current(
     })
 }
 
+/// Write the version file for `runtime_identity` and `python_skills`, keeping the recorded
+/// startup-script packages (`extra_uv_args`) of a version file already there.
 pub(crate) fn write_bootstrap_version(
     venv: &Path,
     runtime_identity: &str,
     python_skills: &[BootstrapPythonSkill],
 ) -> anyhow::Result<()> {
-    let version = BootstrapVersion {
-        schema: BOOTSTRAP_SCHEMA,
-        runtime: Some(runtime_identity.to_string()),
-        snapshot: Some(STATE_SNAPSHOT_REQUIREMENT.to_string()),
-        extra_uv_args: Some(
-            default_rlm_extra_uv_args()
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        ),
-        python_skills: Some(python_skills.to_vec()),
+    let extra_uv_args = read_bootstrap_version(venv).and_then(|version| version.extra_uv_args);
+    write_version_file(
+        venv,
+        &BootstrapVersion {
+            schema: BOOTSTRAP_SCHEMA,
+            runtime: Some(runtime_identity.to_string()),
+            snapshot: Some(STATE_SNAPSHOT_REQUIREMENT.to_string()),
+            extra_uv_args: Some(extra_uv_args.unwrap_or_default()),
+            python_skills: Some(python_skills.to_vec()),
+        },
+    )
+}
+
+/// Add `installed` to the version file's recorded startup-script packages. Packages recorded
+/// for other startup scripts stay: the venv is a shared cache, like its skills.
+pub(crate) fn record_python_requirements(venv: &Path, installed: &[String]) -> anyhow::Result<()> {
+    let Some(mut version) = read_bootstrap_version(venv) else {
+        return Err(anyhow::anyhow!(
+            "cannot record Python packages: {} has no version file",
+            venv.display()
+        ));
     };
+    let recorded = version.extra_uv_args.get_or_insert_with(Vec::new);
+    for requirement in installed {
+        if !recorded.contains(requirement) {
+            recorded.push(requirement.clone());
+        }
+    }
+    write_version_file(venv, &version)
+}
+
+fn write_version_file(venv: &Path, version: &BootstrapVersion) -> anyhow::Result<()> {
     std::fs::write(
         venv.join(BOOTSTRAP_VERSION_FILE),
-        format!("{}\n", serde_json::to_string(&version)?),
+        format!("{}\n", serde_json::to_string(version)?),
     )?;
     Ok(())
 }

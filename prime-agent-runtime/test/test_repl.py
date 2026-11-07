@@ -290,6 +290,27 @@ class ReplTest(unittest.TestCase):
         events = self.repl.execute("bg3", "task.cancel()\nimport asyncio\nawait asyncio.sleep(0.05)\nlen(acc)")
         self.assertEqual(one(events, "done")["status"], "ok")
 
+    def test_cell_time_sleep_keeps_the_event_loop_running(self):
+        setup = "\n".join(
+            [
+                "import asyncio, time",
+                "ticks = []",
+                "async def tick():",
+                "    while True:",
+                "        ticks.append(1)",
+                "        await asyncio.sleep(0.01)",
+                "task = asyncio.create_task(tick())",
+                "def sync_wait():",
+                "    time.sleep(0)",
+                "    return 'sync'",
+            ]
+        )
+        self.assertEqual(one(self.repl.execute("sl1", setup), "done")["status"], "ok")
+        events = self.repl.execute("sl2", "before = len(ticks)\ntime.sleep(0.2)\nlen(ticks) - before")
+        self.assertGreater(int(one(events, "result")["text"]), 5)
+        events = self.repl.execute("sl3", "task.cancel()\nsync_wait()")
+        self.assertEqual(one(events, "result")["text"], "'sync'")
+
     def test_output_after_done_carries_null_id(self):
         with tempfile.TemporaryDirectory() as tmp:
             trigger = os.path.join(tmp, "go")
@@ -597,10 +618,10 @@ class ReplTest(unittest.TestCase):
         # so the foreground cancel can take effect.
         code = "\n".join(
             [
-                "import asyncio, time",
+                "import asyncio, threading",
                 "async def hog():",
                 "    while True:",
-                "        time.sleep(0.05)",
+                "        threading.Event().wait(0.05)",
                 "hog_task = asyncio.create_task(hog())",
                 "await asyncio.sleep(1e9)",
             ]

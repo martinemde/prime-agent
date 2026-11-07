@@ -114,6 +114,7 @@ async fn main() {
             let python = ensure_kernel_python(EnsureKernelPythonOptions {
                 python_skills: bench_python_skills(),
                 on_progress: None,
+                ..Default::default()
             })
             .await
             .expect("kernel python");
@@ -128,6 +129,7 @@ async fn main() {
             let python = ensure_kernel_python(EnsureKernelPythonOptions {
                 python_skills: bench_python_skills(),
                 on_progress: None,
+                ..Default::default()
             })
             .await
             .expect("kernel python");
@@ -178,6 +180,7 @@ async fn main() {
             let python = ensure_kernel_python(EnsureKernelPythonOptions {
                 python_skills: bench_python_skills(),
                 on_progress: None,
+                ..Default::default()
             })
             .await
             .expect("kernel python");

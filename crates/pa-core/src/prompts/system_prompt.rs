@@ -99,6 +99,9 @@ pub struct BuildSystemPromptOptions<'a> {
     pub can_spawn: bool,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
+    /// The agent dir's kernel startup scripts, whose packages are listed as
+    /// pre-installed; `None` means the shipped `system.py` alone.
+    pub startup_scripts: Option<crate::kernel::bootstrap::KernelStartupScripts>,
 }
 
 /// Build the system prompt (assembled text only).
@@ -111,6 +114,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 #[must_use]
 pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemPromptBreakdown {
     let mut segments: Vec<PromptSegment> = Vec::new();
+    let startup_scripts = options.startup_scripts.clone().unwrap_or_default();
 
     // The static prefix: the user's replacement prompt, or the layered files.
     match options.custom_prompt.as_deref() {
@@ -164,8 +168,8 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
 
     segments.push(PromptSegment::dynamic_segment(
         "packages",
-        "kernel bootstrap defaults",
-        packages_section(),
+        "kernel startup scripts (system.py, user.py)",
+        packages_section(&startup_scripts.requirements().requirements),
     ));
 
     let context = context_files_section(&options.context_files);
@@ -239,11 +243,26 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     }
 }
 
-fn packages_section() -> String {
-    use crate::kernel::bootstrap::default_rlm_extra_import_labels;
+/// How the prompt names a pre-installed package: the requirement's distribution name, with the
+/// import name first where the two differ for a shipped default.
+fn package_label(requirement: &str) -> String {
+    let name = crate::kernel::bootstrap::requirement_name(requirement);
+    match name.to_ascii_lowercase().as_str() {
+        "pyyaml" => "yaml (PyYAML)".to_string(),
+        "python-dotenv" => "dotenv (python-dotenv)".to_string(),
+        "beautifulsoup4" => "bs4 (Beautiful Soup)".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn packages_section(requirements: &[String]) -> String {
+    let labels: Vec<String> = requirements
+        .iter()
+        .map(|requirement| package_label(requirement))
+        .collect();
     let mut lines = vec![format!(
         "Pre-installed Python packages: {}.",
-        default_rlm_extra_import_labels().join(", ")
+        labels.join(", ")
     )];
     lines.push(
         "Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module)."
@@ -473,6 +492,20 @@ mod tests {
         assert!(tail.contains("<available_skills>"));
         assert!(tail.contains("Recursive agent depth: 0 (root)"));
         assert!(tail.contains("Pre-installed Python packages: requests, httpx,"));
+    }
+
+    #[test]
+    fn user_startup_script_packages_are_listed_after_the_system_ones() {
+        use crate::kernel::bootstrap::{KernelStartupScripts, StartupScript};
+        let mut options = base_options();
+        options.startup_scripts = Some(KernelStartupScripts {
+            system: None,
+            user: Some(StartupScript {
+                path: PathBuf::from("/agent/user.py"),
+                source: "# /// script\n# dependencies = [\"rich\"]\n# ///\n".to_string(),
+            }),
+        });
+        assert!(build_system_prompt(&options).contains("pydantic, tyro, rich."));
     }
 
     #[test]

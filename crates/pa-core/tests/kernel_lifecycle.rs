@@ -226,6 +226,59 @@ async fn rlm_bootstrap_injects_the_kernel_surface() {
         .expect("shutdown");
 }
 
+/// The agent dir's `system.py` replaces the shipped setup and `user.py` runs after it in the same
+/// namespace (top-level `await` included); a `user.py` exception prints its traceback to stderr
+/// instead of failing the bootstrap.
+#[tokio::test]
+async fn agent_dir_startup_scripts_set_up_the_namespace() {
+    let Some(base) = test_options(None) else {
+        return;
+    };
+    let agent_dir = tempfile::tempdir().expect("agent dir");
+    std::fs::write(
+        agent_dir.path().join("system.py"),
+        "import asyncio\ngreeting = 'system'\n",
+    )
+    .expect("system.py");
+    std::fs::write(
+        agent_dir.path().join("user.py"),
+        "await asyncio.sleep(0)\ngreeting += ' + user'\nraise RuntimeError('boom')\n",
+    )
+    .expect("user.py");
+    let bootstrap_code = pa_core::kernel::bootstrap::build_kernel_bootstrap_code(
+        &pa_core::kernel::bootstrap::KernelStartupScripts::discover(agent_dir.path()),
+        &[],
+        false,
+    );
+    let manager = ReplKernelManager::new(KernelManagerOptions {
+        bootstrap_code: Some(bootstrap_code.clone()),
+        ..base
+    });
+    manager
+        .start(KernelStartOptions::default())
+        .await
+        .expect("kernel must start");
+    let bootstrap = execute(&manager, &bootstrap_code).await;
+    assert_eq!(bootstrap.status, ExecuteStatus::Ok, "{}", bootstrap.stderr);
+    let user_py = agent_dir.path().join("user.py");
+    assert!(
+        bootstrap
+            .stderr
+            .contains(&format!("Error in {}:", user_py.display()))
+            && bootstrap.stderr.contains("RuntimeError: boom"),
+        "{}",
+        bootstrap.stderr
+    );
+
+    let result = execute(&manager, "(greeting, 'rlm' in globals())").await;
+    assert_eq!(result.result.as_deref(), Some("('system + user', False)"));
+
+    manager
+        .shutdown(KernelShutdownOptions::default())
+        .await
+        .expect("shutdown");
+}
+
 #[tokio::test]
 async fn host_requests_round_trip_to_registered_handlers() {
     let mut handlers = HostRequestHandlers::new();

@@ -58,14 +58,14 @@ pub fn run_prompt_command(args: &[String]) -> i32 {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     match assemble_breakdown(&cwd, parsed.model.as_deref()) {
-        Ok((breakdown, errors)) => {
+        Ok((breakdown, startup_cell, errors)) => {
             for error in &errors {
                 eprintln!("Error: {error}");
             }
             if parsed.json {
-                print_json(&breakdown);
+                print_json(&breakdown, &startup_cell);
             } else {
-                print_text(&breakdown);
+                print_text(&breakdown, &startup_cell);
             }
             0
         }
@@ -79,7 +79,7 @@ pub fn run_prompt_command(args: &[String]) -> i32 {
 fn assemble_breakdown(
     cwd: &std::path::Path,
     model: Option<&str>,
-) -> anyhow::Result<(pa_core::prompts::SystemPromptBreakdown, Vec<String>)> {
+) -> anyhow::Result<(pa_core::prompts::SystemPromptBreakdown, String, Vec<String>)> {
     let agent_dir = get_agent_dir();
     let model_prompts = pa_core::prompts::model_prompts::load_model_prompts(model, &agent_dir);
     let settings = SettingsManager::create(cwd, &agent_dir);
@@ -99,6 +99,7 @@ fn assemble_breakdown(
         .collect::<std::collections::HashMap<String, pa_core::mcp::McpServerConfig>>();
     let (skill_overrides, generic_servers, _manager) =
         pa_core::mcp::McpManager::prompt_gating(user_servers, &agent_dir);
+    let startup_scripts = pa_core::kernel::bootstrap::KernelStartupScripts::discover(&agent_dir);
     let resources = load_resources(ResourceLoaderOptions {
         extra_builtin_skill_overrides: skill_overrides,
         system_prompt: None,
@@ -123,13 +124,19 @@ fn assemble_breakdown(
             generic_mcp_servers: generic_servers,
             rlm_depth: Some(0),
             model_prompt_extras: model_prompts.extras.as_deref(),
+            startup_scripts: Some(startup_scripts.clone()),
             ..Default::default()
         },
     );
-    Ok((breakdown, model_prompts.errors))
+    // The conversation's first cell: the code the kernel's startup ran.
+    let startup_cell = pa_core::session_engine::startup_cell::startup_cell_code(
+        &startup_scripts,
+        &pa_core::session_engine::runtime_wiring::kernel_python_skills(&resources.skills),
+    );
+    Ok((breakdown, startup_cell, model_prompts.errors))
 }
 
-fn print_text(breakdown: &pa_core::prompts::SystemPromptBreakdown) {
+fn print_text(breakdown: &pa_core::prompts::SystemPromptBreakdown, startup_cell: &str) {
     println!("# prime-agent system prompt breakdown");
     println!();
     println!("cached prefix (static layers, byte-stable across sessions):");
@@ -152,6 +159,10 @@ fn print_text(breakdown: &pa_core::prompts::SystemPromptBreakdown) {
     );
     println!();
     println!("{}", breakdown.assembled);
+    println!();
+    println!("# first python_repl cell (prepended to the conversation; the kernel's startup)");
+    println!();
+    println!("{startup_cell}");
 }
 
 fn print_segment(segment: &pa_core::prompts::PromptSegment) {
@@ -163,7 +174,7 @@ fn print_segment(segment: &pa_core::prompts::PromptSegment) {
     );
 }
 
-fn print_json(breakdown: &pa_core::prompts::SystemPromptBreakdown) {
+fn print_json(breakdown: &pa_core::prompts::SystemPromptBreakdown, startup_cell: &str) {
     let segments = breakdown
         .segments
         .iter()
@@ -182,6 +193,7 @@ fn print_json(breakdown: &pa_core::prompts::SystemPromptBreakdown) {
             "segments": segments,
             "cachedPrefixLen": breakdown.cached_prefix_len,
             "prompt": breakdown.assembled,
+            "startupCell": startup_cell,
         })
     );
 }

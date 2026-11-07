@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::anyhow;
 
 use crate::kernel::bootstrap::{
-    build_rlm_bootstrap_code, parse_unavailable_python_skills, KernelBootstrapProgressHandler,
-    KernelPythonSkill, UnavailablePythonSkills,
+    build_kernel_bootstrap_code, parse_unavailable_python_skills, KernelBootstrapProgressHandler,
+    KernelPythonSkill, KernelStartupScripts, UnavailablePythonSkills,
 };
 use crate::kernel::cancellation::AbortSignal;
 use crate::kernel::manager::{KernelStartOptions, ReplKernelManager};
@@ -1057,7 +1057,10 @@ async fn start_kernel_impl(
     let snapshot_dir = options.snapshot_dir.clone();
     // The bounded-await default keys on the bash.completed host handler:
     // one source of truth (the registry the daemon registers the notice in).
-    let bootstrap_code = build_rlm_bootstrap_code(
+    // The startup scripts are read once per boot, so a protocol repair
+    // re-runs the same setup this boot ran.
+    let bootstrap_code = build_kernel_bootstrap_code(
+        &KernelStartupScripts::from_kernel_env(&options.env),
         &options.python_skills,
         options
             .host_handlers

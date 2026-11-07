@@ -594,10 +594,47 @@ def _interrupt_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
     return {"event": "error", "id": cell_id, "ename": "KeyboardInterrupt", "evalue": "", "traceback": lines}
 
 
-def _compile_cell(code: str, filename: str) -> tuple[list[types.CodeType], bool]:
+class _CellSleepToAsync(ast.NodeTransformer):
+    """Rewrite cell-level `time.sleep(x)` to `await asyncio.sleep(x)`: the same wait, but the
+    kernel's event loop keeps serving host replies and background tasks meanwhile. Sync
+    scopes (def, lambda, class body, generator expression) cannot await and stay as written."""
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        self.generic_visit(node)
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "sleep"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "time"
+        ):
+            asyncio_module = ast.Call(ast.Name("__import__", ast.Load()), [ast.Constant("asyncio")], [])
+            sleep = ast.Attribute(asyncio_module, "sleep", ast.Load())
+            return ast.copy_location(ast.Await(ast.Call(sleep, node.args, node.keywords)), node)
+        return node
+
+    def _keep(self, node: ast.AST) -> ast.AST:
+        return node
+
+    visit_FunctionDef = visit_Lambda = visit_ClassDef = visit_GeneratorExp = _keep
+
+
+def _time_is_the_module(tree: ast.Module, ns: dict[str, Any]) -> bool:
+    """`time` names the time module: already bound to it, or imported plainly by the cell."""
+    if ns.get("time") is time:
+        return True
+    return any(
+        isinstance(node, ast.Import) and any(alias.name == "time" and alias.asname is None for alias in node.names)
+        for node in ast.walk(tree)
+    )
+
+
+def _compile_cell(code: str, filename: str, ns: dict[str, Any]) -> tuple[list[types.CodeType], bool]:
     """Compile a cell; a trailing expression compiles separately in eval mode."""
     linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
     tree = ast.parse(code, filename)
+    if _time_is_the_module(tree, ns):
+        tree = ast.fix_missing_locations(_CellSleepToAsync().visit(tree))
     trailing: ast.Expression | None = None
     if tree.body and isinstance(tree.body[-1], ast.Expr):
         trailing = ast.Expression(tree.body.pop().value)
@@ -659,7 +696,7 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
     cell_token = _current_cell.set(cell_id)
     execution_token = _current_cell_execution.set(execution)
     try:
-        codes, has_trailing = _compile_cell(req["code"], filename)
+        codes, has_trailing = _compile_cell(req["code"], filename, ns)
         assert _loop is not None
         task = _loop.create_task(_run_codes(codes, ns))
         execution.owner = task

@@ -260,8 +260,9 @@ pub fn kernel_provisioner(
     on_bootstrap_result: Option<crate::kernel::provisioner::KernelBootstrapResultHandler>,
 ) -> Arc<KernelProvisioner> {
     let mut env = HashMap::with_capacity(3);
+    // Also where the kernel's startup scripts (system.py, user.py) are read.
     env.insert(
-        "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
+        crate::kernel::bootstrap::KERNEL_AGENT_DIR_ENV.to_string(),
         agent_dir.to_string_lossy().to_string(),
     );
     // Always set: an unsaved session blanks an inherited id (a run started inside another

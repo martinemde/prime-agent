@@ -117,6 +117,26 @@ fn version_file_round_trips() {
     ));
 }
 
+/// Recorded startup-script packages accumulate across scripts and survive the version rewrite a
+/// skill sync does, so a venv shared by sessions keeps what it installed.
+#[test]
+fn recorded_python_requirements_survive_version_rewrites() {
+    let dir = tempfile::tempdir().unwrap();
+    write_bootstrap_version(dir.path(), "sha256:abc", &[]).unwrap();
+    record_python_requirements(dir.path(), &["requests".to_string()]).unwrap();
+    write_bootstrap_version(dir.path(), "sha256:abc", &[]).unwrap();
+    record_python_requirements(dir.path(), &["rich".to_string(), "requests".to_string()]).unwrap();
+    assert_eq!(
+        read_bootstrap_version(dir.path()).and_then(|version| version.extra_uv_args),
+        Some(vec!["requests".to_string(), "rich".to_string()])
+    );
+    assert!(requirements_recorded(dir.path(), &["rich".to_string()]));
+    assert!(!requirements_recorded(
+        dir.path(),
+        &["rich>=13".to_string()]
+    ));
+}
+
 #[test]
 fn probe_memo_key_distinguishes_every_input_and_drops_on_invalidate() {
     let _memo_state = MEMO_STATE_LOCK
@@ -1144,6 +1164,7 @@ async fn unwritable_venv_disables_uncovered_skills_instead_of_failing() {
     let outcome = super::super::ensure_kernel_venv(
         &options,
         &normalize_python_skills(&options.python_skills),
+        &[],
         venv.clone(),
     )
     .await;
@@ -1191,10 +1212,14 @@ async fn unwritable_stale_venv_names_the_venv_and_both_env_overrides() {
 
     set_mode(&venv, 0o555);
     set_mode(dir.path(), 0o555);
-    let error =
-        super::super::ensure_kernel_venv(&EnsureKernelPythonOptions::default(), &[], venv.clone())
-            .await
-            .expect_err("an unusable venv in a read-only dir is a setup error");
+    let error = super::super::ensure_kernel_venv(
+        &EnsureKernelPythonOptions::default(),
+        &[],
+        &[],
+        venv.clone(),
+    )
+    .await
+    .expect_err("an unusable venv in a read-only dir is a setup error");
     set_mode(dir.path(), 0o755);
     set_mode(&venv, 0o755);
 
