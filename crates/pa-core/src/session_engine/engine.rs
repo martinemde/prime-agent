@@ -576,6 +576,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
                 &model_prompts.errors,
             ));
     }
+    let startup_scripts =
+        crate::kernel::bootstrap::KernelStartupScripts::discover(&config.agent_dir);
+    let startup_cell = super::startup_cell::startup_cell_messages(
+        &super::startup_cell::startup_cell_code(&startup_scripts, &python_skills),
+    );
     let system_prompt = crate::prompts::system_prompt::build_system_prompt(
         &crate::prompts::system_prompt::BuildSystemPromptOptions {
             custom_prompt: resources.system_prompt.clone(),
@@ -604,9 +609,7 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             can_spawn: config.rlm_subagent_host.is_some(),
             generic_mcp_servers,
             append_system_prompt: Some(resources.append_system_prompt.join("\n\n")),
-            startup_scripts: Some(crate::kernel::bootstrap::KernelStartupScripts::discover(
-                &config.agent_dir,
-            )),
+            startup_scripts: Some(startup_scripts.clone()),
             ..Default::default()
         },
     );
@@ -722,7 +725,10 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
         // else (the harness digest included) becomes a user turn.
         convert_to_llm: Some(super::request_timing::instrument_convert_to_llm(
             std::sync::Arc::clone(&request_timing_wiring),
-            super::refinement_gate::convert_to_llm(refinement_settings.reopen()),
+            super::startup_cell::with_startup_cell(
+                super::refinement_gate::convert_to_llm(refinement_settings.reopen()),
+                startup_cell,
+            ),
         )),
         // The Rust engine wires no transform, so the instrumented seam
         // wraps a pass-through that marks the turn's dispatch moment.

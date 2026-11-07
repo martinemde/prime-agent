@@ -6,7 +6,7 @@ The harness often sends messages to the agent. These are user messages starting 
 
 ## Kernel setup
 
-The REPL's starting state comes from `system.py`, shown in full after the Skills section below. It binds `bash`, `rlm`, and `mcp`, and its comments are their API reference. Read it as code that already ran: those names, and the packages it declares, are ready in your first cell. A user's `user.py`, when present, runs after the Python skills are imported and is shown in the session-specific part of this prompt.
+The conversation opens with your first `python_repl` cell, which already ran: at every kernel start the REPL runs its startup scripts — `system.py`, the Python skill imports, then the user's `user.py` when present. `system.py` binds `bash`, `rlm`, and `mcp`, and its comments are their API reference. Everything the scripts imported, defined, or set is in the namespace now.
 
 ## Core tools
 

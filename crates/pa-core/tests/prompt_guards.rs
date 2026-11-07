@@ -62,7 +62,6 @@ const DYNAMIC_ONLY_MARKERS: &[&str] = &[
 fn static_layers_contain_no_dynamic_content() {
     for (name, text) in [
         ("core", CORE_LAYER),
-        ("system.py", SHIPPED_SYSTEM_SCRIPT),
         ("usage", USAGE_LAYER),
         ("opinionated", OPINIONATED_LAYER),
         ("model-prompts", MODEL_PROMPTS_TOML),
@@ -106,9 +105,8 @@ fn cached_prefix_is_stable_across_sessions() {
     assert_eq!(
         &first.assembled[..first.cached_prefix_len],
         &format!(
-            "{}\n\n```python\n# system.py\n{}\n```\n\n{}\n\n{}\n\nmodel guidance.",
+            "{}\n\n{}\n\n{}\n\nmodel guidance.",
             CORE_LAYER.trim(),
-            SHIPPED_SYSTEM_SCRIPT.trim_end(),
             USAGE_LAYER.trim(),
             OPINIONATED_LAYER.trim()
         )

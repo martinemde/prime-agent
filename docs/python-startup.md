@@ -22,9 +22,9 @@ At every kernel start, after a saved namespace is restored, in this order:
 3. `user.py`
 
 Like `PYTHONSTARTUP`, each script runs in the REPL's `__main__` namespace, so
-its top-level names are visible to the model's cells. The system prompt
-includes `user.py` verbatim, so the model knows what it set up; keep secrets
-out of it. Top-level `await` works
+its top-level names are visible to the model's cells. The model sees both
+scripts verbatim as the first `python_repl` cell of its conversation, so it
+knows what already ran; keep secrets out of them. Top-level `await` works
 as it does in a cell. If a script raises, its traceback is printed to the
 kernel's stderr and startup continues. A change takes effect at the next
 kernel start, for example a new session or `/reload`.
@@ -57,12 +57,11 @@ must already have every declared package.
 The default system setup binds `rlm`, `bash`, and `mcp`, plus `asyncio` and
 `NO_COLOR=1`, and declares the default packages (`requests`, `httpx`,
 `pyyaml`, `pandas`, `numpy`, and others). Its comments are the model's API
-reference for those names: the system prompt includes the file verbatim, in
-the cached prefix. Its source is
+reference for those names, read from the first cell. Its source is
 [`crates/pa-core/src/kernel/bootstrap/system.py`](../crates/pa-core/src/kernel/bootstrap/system.py).
 
 Prefer `user.py` for additions. Replace `system.py` only when you want a
-different base: copy the shipped file and edit it. The prompt shows your
+different base: copy the shipped file and edit it. The first cell shows your
 replacement instead of the shipped file, so keep the API comments for
 whatever it binds.
 

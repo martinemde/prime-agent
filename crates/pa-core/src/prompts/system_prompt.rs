@@ -1,8 +1,6 @@
 //! Layered system-prompt assembly: static layer files first (cacheable),
 //! every session-specific value last. See the parent module docs.
 
-use std::fmt::Write as _;
-
 use crate::skills::{format_skills_for_prompt, Skill};
 
 use super::layers;
@@ -101,9 +99,8 @@ pub struct BuildSystemPromptOptions<'a> {
     pub can_spawn: bool,
     /// Enabled user-configured generic MCP servers.
     pub generic_mcp_servers: Vec<String>,
-    /// The agent dir's kernel startup scripts: their packages are listed as
-    /// pre-installed and `user.py` is shown verbatim; `None` means the shipped
-    /// `system.py` alone.
+    /// The agent dir's kernel startup scripts, whose packages are listed as
+    /// pre-installed; `None` means the shipped `system.py` alone.
     pub startup_scripts: Option<crate::kernel::bootstrap::KernelStartupScripts>,
 }
 
@@ -127,7 +124,6 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
                 "--system-prompt",
                 custom.to_string(),
             ));
-            segments.push(system_setup_segment(&startup_scripts));
         }
         _ => {
             segments.push(PromptSegment::static_segment(
@@ -135,7 +131,6 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
                 layers::layer_source("core").unwrap_or_default(),
                 layers::CORE_LAYER.trim().to_string(),
             ));
-            segments.push(system_setup_segment(&startup_scripts));
             segments.push(PromptSegment::static_segment(
                 "usage",
                 layers::layer_source("usage").unwrap_or_default(),
@@ -174,7 +169,7 @@ pub fn system_prompt_breakdown(options: &BuildSystemPromptOptions) -> SystemProm
     segments.push(PromptSegment::dynamic_segment(
         "packages",
         "kernel startup scripts (system.py, user.py)",
-        startup_section(&startup_scripts),
+        packages_section(&startup_scripts.requirements().requirements),
     ));
 
     let context = context_files_section(&options.context_files);
@@ -258,37 +253,6 @@ fn package_label(requirement: &str) -> String {
         "beautifulsoup4" => "bs4 (Beautiful Soup)".to_string(),
         _ => name.to_string(),
     }
-}
-
-/// The system setup the kernel ran, verbatim: the shipped `system.py` or the agent dir's
-/// replacement. Static, since it changes only when the file does.
-fn system_setup_segment(scripts: &crate::kernel::bootstrap::KernelStartupScripts) -> PromptSegment {
-    let (source, name) = scripts.system_source();
-    PromptSegment::static_segment(
-        "system-setup",
-        "kernel/bootstrap/system.py, or the agent dir's system.py",
-        format!("```python\n# {name}\n{}\n```", source.trim_end()),
-    )
-}
-
-/// The pre-installed packages, then the `user.py` source the kernel runs at startup.
-fn startup_section(scripts: &crate::kernel::bootstrap::KernelStartupScripts) -> String {
-    let mut section = packages_section(&scripts.requirements().requirements);
-    if let Some(user) = scripts
-        .user
-        .as_ref()
-        .filter(|user| !user.source.trim().is_empty())
-    {
-        let _ = write!(
-            section,
-            "\n\nAt every kernel start, after the system setup and Python skill imports, this \
-             `{}` ran in the REPL namespace; its imports, definitions, and environment changes \
-             are already in effect:\n\n```python\n{}\n```",
-            user.path.display(),
-            user.source.trim_end()
-        );
-    }
-    section
 }
 
 fn packages_section(requirements: &[String]) -> String {
@@ -505,16 +469,15 @@ mod tests {
             .map(|segment| segment.name)
             .collect();
         assert_eq!(
-            names[..5],
-            ["core", "system-setup", "usage", "opinionated", "packages"],
-            "core, the shipped system.py, usage/opinionated layers, then the dynamic tail"
+            names[..4],
+            ["core", "usage", "opinionated", "packages"],
+            "core/usage/opinionated layers, then the dynamic tail"
         );
         assert_eq!(
             &prompt[..breakdown.cached_prefix_len],
             format!(
-                "{}\n\n```python\n# system.py\n{}\n```\n\n{}\n\n{}",
+                "{}\n\n{}\n\n{}",
                 layers::CORE_LAYER.trim(),
-                crate::kernel::bootstrap::SHIPPED_SYSTEM_SCRIPT.trim_end(),
                 layers::USAGE_LAYER.trim(),
                 layers::OPINIONATED_LAYER.trim()
             )
@@ -528,39 +491,17 @@ mod tests {
     }
 
     #[test]
-    fn user_startup_script_is_shown_verbatim_with_its_packages() {
+    fn user_startup_script_packages_are_listed_after_the_system_ones() {
         use crate::kernel::bootstrap::{KernelStartupScripts, StartupScript};
-        let source = "# /// script\n# dependencies = [\"rich\"]\n# ///\nUSER_PY_LOADED = True\n";
         let mut options = base_options();
         options.startup_scripts = Some(KernelStartupScripts {
             system: None,
             user: Some(StartupScript {
                 path: PathBuf::from("/agent/user.py"),
-                source: source.to_string(),
+                source: "# /// script\n# dependencies = [\"rich\"]\n# ///\n".to_string(),
             }),
         });
-        let prompt = build_system_prompt(&options);
-        assert!(prompt.contains("pydantic, tyro, rich."));
-        assert!(prompt.contains("`/agent/user.py` ran in the REPL namespace"));
-        assert!(prompt.contains(&format!("```python\n{}```", source)));
-        assert!(!build_system_prompt(&base_options()).contains("ran in the REPL namespace"));
-    }
-
-    #[test]
-    fn agent_dir_system_script_replaces_the_shipped_one_in_the_prefix() {
-        use crate::kernel::bootstrap::{KernelStartupScripts, StartupScript};
-        let mut options = base_options();
-        options.startup_scripts = Some(KernelStartupScripts {
-            system: Some(StartupScript {
-                path: PathBuf::from("/agent/system.py"),
-                source: "from rlm import bash, rlm\n".to_string(),
-            }),
-            user: None,
-        });
-        let breakdown = system_prompt_breakdown(&options);
-        let prefix = &breakdown.assembled[..breakdown.cached_prefix_len];
-        assert!(prefix.contains("```python\n# /agent/system.py\nfrom rlm import bash, rlm\n```"));
-        assert!(!prefix.contains("import rlm.mcp as mcp"));
+        assert!(build_system_prompt(&options).contains("pydantic, tyro, rich."));
     }
 
     #[test]
@@ -659,15 +600,8 @@ mod tests {
             .map(|segment| segment.name)
             .collect();
         assert_eq!(
-            names[..6],
-            [
-                "core",
-                "system-setup",
-                "usage",
-                "opinionated",
-                "model-prompts",
-                "packages"
-            ],
+            names[..5],
+            ["core", "usage", "opinionated", "model-prompts", "packages"],
             "extras are the last static segment, directly before the dynamic tail"
         );
     }
