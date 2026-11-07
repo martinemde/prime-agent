@@ -22,7 +22,9 @@ pub use runtime_code::{
     UnavailablePythonSkills, PYTHON_SKILL_IMPORT_ERROR_REPORT_MARKER,
 };
 pub(crate) use startup_scripts::{requirement_name, KERNEL_AGENT_DIR_ENV};
-pub use startup_scripts::{KernelStartupScripts, StartupRequirements, StartupScript};
+pub use startup_scripts::{
+    KernelStartupScripts, StartupRequirements, StartupScript, SHIPPED_SYSTEM_SCRIPT,
+};
 use venv::{
     bootstrap_venv, ensure_uv, expand_home, has_prime_agent_runtime, missing_python_requirements,
     missing_python_skill_import_labels, normalize_python_skills, requirements_recorded,

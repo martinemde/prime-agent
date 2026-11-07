@@ -217,7 +217,7 @@ mod tests {
     #[test]
     fn bootstrap_code_without_skills_binds_rlm() {
         let code = build_rlm_bootstrap_code(&[], false);
-        assert!(code.contains("import rlm as _prime_agent_rlm_module"));
+        assert!(code.contains("from rlm import bash, rlm"));
         assert!(!code.contains("_PrimeAgentUnavailableSkill"));
     }
 

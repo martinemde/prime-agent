@@ -15,6 +15,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use pa_core::kernel::bootstrap::SHIPPED_SYSTEM_SCRIPT;
 use pa_core::prompts::layers::{CORE_LAYER, OPINIONATED_LAYER, USAGE_LAYER};
 use pa_core::prompts::model_prompts::MODEL_PROMPTS_TOML;
 use pa_core::prompts::system_prompt::{
@@ -61,6 +62,7 @@ const DYNAMIC_ONLY_MARKERS: &[&str] = &[
 fn static_layers_contain_no_dynamic_content() {
     for (name, text) in [
         ("core", CORE_LAYER),
+        ("system.py", SHIPPED_SYSTEM_SCRIPT),
         ("usage", USAGE_LAYER),
         ("opinionated", OPINIONATED_LAYER),
         ("model-prompts", MODEL_PROMPTS_TOML),
@@ -104,8 +106,9 @@ fn cached_prefix_is_stable_across_sessions() {
     assert_eq!(
         &first.assembled[..first.cached_prefix_len],
         &format!(
-            "{}\n\n{}\n\n{}\n\nmodel guidance.",
+            "{}\n\n```python\n# system.py\n{}\n```\n\n{}\n\n{}\n\nmodel guidance.",
             CORE_LAYER.trim(),
+            SHIPPED_SYSTEM_SCRIPT.trim_end(),
             USAGE_LAYER.trim(),
             OPINIONATED_LAYER.trim()
         )
@@ -303,11 +306,8 @@ fn kernel_bound_names() -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for line in code.lines() {
         let line = line.trim_start();
-        if line.starts_with("rlm = ") {
-            names.insert("rlm".to_string());
-        }
-        if line.starts_with("bash = ") {
-            names.insert("bash".to_string());
+        if let Some(rest) = line.strip_prefix("from rlm import ") {
+            names.extend(rest.split(',').map(|name| name.trim().to_string()));
         }
         if let Some(rest) = line.strip_prefix("import rlm.mcp as ") {
             names.insert(rest.trim().to_string());
@@ -444,10 +444,27 @@ fn required_surface_tokens() -> BTreeSet<String> {
     required
 }
 
-/// Surface tokens documented in the core layer: bullet entries whose first
-/// backtick token is a lowercase module path.
+/// Surface tokens documented in the prompt: core-layer bullet entries whose first backtick token
+/// is a lowercase module path, and the shipped `system.py`'s signature comments
+/// (`# [await ]name(...`; indented comment lines are prose).
 fn documented_surface_tokens() -> BTreeSet<String> {
     let mut documented = BTreeSet::new();
+    for line in SHIPPED_SYSTEM_SCRIPT.lines() {
+        let Some(comment) = line.strip_prefix("# ") else {
+            continue;
+        };
+        let comment = comment.strip_prefix("await ").unwrap_or(comment);
+        let Some((token, _)) = comment.split_once('(') else {
+            continue;
+        };
+        if token.starts_with(|ch: char| ch.is_ascii_lowercase())
+            && token
+                .chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '.')
+        {
+            documented.insert(token.to_string());
+        }
+    }
     for line in CORE_LAYER.lines() {
         let Some(rest) = line.trim_start().strip_prefix("- `") else {
             continue;
@@ -492,7 +509,7 @@ fn core_layer_documents_the_real_tool_surface() {
         assert!(
             known,
             "prompt documents unknown tool {token:?}: a tool-surface change must \
-             update prompts/layers/core.md (and this test's token mapping)"
+             update prompts/layers/core.md or kernel/bootstrap/system.py (and this test's token mapping)"
         );
     }
 
@@ -507,7 +524,7 @@ fn core_layer_documents_the_real_tool_surface() {
         assert!(
             documented_form,
             "tool {token:?} is on the registered surface but the prompt does not \
-             document it: update prompts/layers/core.md"
+             document it: update prompts/layers/core.md or kernel/bootstrap/system.py"
         );
     }
 }

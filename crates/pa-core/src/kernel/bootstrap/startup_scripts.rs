@@ -19,7 +19,7 @@ const SYSTEM_SCRIPT_FILE_NAME: &str = "system.py";
 const USER_SCRIPT_FILE_NAME: &str = "user.py";
 
 /// The shipped system setup, used when the agent dir has no `system.py`.
-pub(crate) const SHIPPED_SYSTEM_SCRIPT: &str = include_str!("system.py");
+pub const SHIPPED_SYSTEM_SCRIPT: &str = include_str!("system.py");
 
 /// One startup script read from disk.
 #[derive(Debug, Clone, PartialEq, Eq)]

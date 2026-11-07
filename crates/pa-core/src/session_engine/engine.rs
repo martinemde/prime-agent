@@ -604,11 +604,9 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
             can_spawn: config.rlm_subagent_host.is_some(),
             generic_mcp_servers,
             append_system_prompt: Some(resources.append_system_prompt.join("\n\n")),
-            python_requirements: Some(
-                crate::kernel::bootstrap::KernelStartupScripts::discover(&config.agent_dir)
-                    .requirements()
-                    .requirements,
-            ),
+            startup_scripts: Some(crate::kernel::bootstrap::KernelStartupScripts::discover(
+                &config.agent_dir,
+            )),
             ..Default::default()
         },
     );
