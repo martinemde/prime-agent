@@ -91,8 +91,8 @@ impl AgentSessionEngine {
         if self.session_input_queued() {
             return Vec::new();
         }
-        // The goal arm takes exclusive priority (an active goal owns the boundary).
-        if self.goal_owns_continuation_wakeup().await {
+        // A blocked goal must not fall through to autonomous work.
+        if self.goal_prevents_autonomous_continuation().await {
             return Vec::new();
         }
         // A pending requested compaction consumes the stop.
@@ -155,13 +155,19 @@ impl AgentSessionEngine {
         }
     }
 
-    /// Whether an active thread goal owns the continuation wakeup.
-    async fn goal_owns_continuation_wakeup(&self) -> bool {
+    /// Active goals own continuation; blocked goals forbid autonomous fallback.
+    async fn goal_prevents_autonomous_continuation(&self) -> bool {
         let Some(handles) = self.goal_runtime.lock().expect("goal runtime lock").clone() else {
             return false;
         };
         let driver = handles.driver.lock().await;
-        driver.owns_continuation_wakeup()
+        let blocked = driver.state().status == pa_core::goals::GoalStatus::Blocked;
+        let prevents = blocked || driver.owns_continuation_wakeup();
+        drop(driver);
+        if blocked {
+            self.clear_autonomous_continuations();
+        }
+        prevents
     }
 
     /// Whether a pending model-requested compaction consumes the stop (the
@@ -248,7 +254,7 @@ impl AgentSessionEngine {
             }
             return;
         }
-        if self.goal_owns_continuation_wakeup().await {
+        if self.goal_prevents_autonomous_continuation().await {
             return;
         }
         let Some(message) = self.latest_settled_assistant().await else {
@@ -340,6 +346,74 @@ mod tests {
     use super::*;
     use crate::agent_engine::tests::{admit, faux_engine_with_settings, FAUX_TEST_LOCK};
     use crate::engine::EngineEvent;
+
+    #[test]
+    fn a_blocked_goal_stops_autonomous_fallback_and_held_work() {
+        let _faux = FAUX_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (engine, _dir) = faux_engine_with_settings(
+            &serde_json::json!({ "responses": ["warm", "waiting", "must not run"] }),
+            u64::MAX,
+        );
+        let engine = Arc::new(engine);
+        engine.register_arc();
+        let mut events = Vec::new();
+        admit(&engine, "warm".to_string(), &mut events);
+        admit(
+            &engine,
+            "/autonomous on --max-continuations 1 --max-turns 5".to_string(),
+            &mut events,
+        );
+        engine.runtime.block_on(async {
+            let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
+            let mut driver = handles.driver.lock().await;
+            let mut session = handles.session.lock().await;
+            driver
+                .start(&mut session, "finish deployment", None)
+                .unwrap();
+            driver
+                .block(
+                    &mut session,
+                    pa_types::goal::GoalBlocker {
+                        reason: "deployment needs approval".to_string(),
+                        waiting_on: pa_types::goal::GoalWaitingOn::User,
+                        resume_when: "approval arrives".to_string(),
+                        independent_work_remaining: false,
+                    },
+                )
+                .unwrap();
+        });
+        *engine.held_autonomous_continuation.lock().unwrap() =
+            Some("stale continuation".to_string());
+        engine
+            .autonomous_awaits_rlm_work
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        events.clear();
+        admit(&engine, "status".to_string(), &mut events);
+        let replies: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                crate::engine::EngineEvent::AssistantMessage(value) => Some(
+                    value["content"][0]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, vec!["waiting"]);
+        assert!(engine
+            .held_autonomous_continuation
+            .lock()
+            .unwrap()
+            .is_none());
+        assert!(!engine
+            .autonomous_awaits_rlm_work
+            .load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(engine.autonomous.blocking_lock().continuations_used, 0);
+    }
 
     /// Inject the engine's background-bash liveness probe (a `true` probe
     /// = a live background `bash()` handle).

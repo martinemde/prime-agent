@@ -11,6 +11,7 @@ pub enum GoalStatus {
     Idle,
     Active,
     Paused,
+    Blocked,
     BudgetLimited,
     Complete,
     Error,
@@ -25,11 +26,30 @@ impl GoalStatus {
             GoalStatus::Idle => "idle",
             GoalStatus::Active => "active",
             GoalStatus::Paused => "paused",
+            GoalStatus::Blocked => "blocked",
             GoalStatus::BudgetLimited => "budget_limited",
             GoalStatus::Complete => "complete",
             GoalStatus::Error => "error",
         }
     }
+}
+
+/// The party or event that must unblock a goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GoalWaitingOn {
+    User,
+    External,
+}
+
+/// A concrete dependency that prevents all remaining independent goal work.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalBlocker {
+    pub reason: String,
+    pub waiting_on: GoalWaitingOn,
+    pub resume_when: String,
+    pub independent_work_remaining: bool,
 }
 
 /// The persisted thread-goal state (custom entry data of the
@@ -65,6 +85,8 @@ pub struct GoalState {
     pub last_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<GoalBlocker>,
 }
 
 impl Default for GoalState {
@@ -91,5 +113,6 @@ pub fn empty_goal_state() -> GoalState {
         updated_at: None,
         last_reason: None,
         last_error: None,
+        blocker: None,
     }
 }

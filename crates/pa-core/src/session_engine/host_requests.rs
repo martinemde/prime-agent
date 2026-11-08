@@ -97,6 +97,44 @@ pub fn handle_goal_host_request(
             let goal = complete_goal_from_host(driver, session)?;
             Ok(goal_host_response(&goal, true))
         }
+        "goal.block" => {
+            let blocker = pa_types::goal::GoalBlocker {
+                reason: record
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("goal.block reason must be a string"))?
+                    .to_string(),
+                waiting_on: serde_json::from_value(record.get("waiting_on").cloned().ok_or_else(
+                    || anyhow::anyhow!("goal.block waiting_on must be user or external"),
+                )?)?,
+                resume_when: record
+                    .get("resume_when")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("goal.block resume_when must be a string"))?
+                    .to_string(),
+                independent_work_remaining: record
+                    .get("independent_work_remaining")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("goal.block independent_work_remaining must be a boolean")
+                    })?,
+            };
+            driver.block(session, blocker)?;
+            Ok(goal_host_response(
+                &driver.state_with_creation_elapsed(),
+                false,
+            ))
+        }
+        "goal.resume" => {
+            if driver.state().status != GoalStatus::Blocked {
+                anyhow::bail!("goal.resume can only resume a blocked goal; ask the user to resume paused or budget-limited goals with /goal resume");
+            }
+            driver.resume(session)?;
+            Ok(goal_host_response(
+                &driver.state_with_creation_elapsed(),
+                false,
+            ))
+        }
         _ => anyhow::bail!("unknown goal request type \"{request_type}\""),
     }
 }
@@ -113,6 +151,9 @@ fn create_goal_from_host(
         ),
         GoalStatus::Paused => anyhow::bail!(
             "cannot create a new goal because a paused goal exists; ask the user to resume it with /goal resume or clear it with /goal clear"
+        ),
+        GoalStatus::Blocked => anyhow::bail!(
+            "cannot create a new goal because a blocked goal exists; resume it explicitly with goal.resume() or ask the user to clear it with /goal clear"
         ),
         GoalStatus::BudgetLimited => anyhow::bail!(
             "cannot create a new goal because a budget-limited goal exists; ask the user to resume it with /goal resume or clear it with /goal clear"
@@ -433,6 +474,54 @@ mod tests {
         let error = handle_goal_host_request("goal.nope", &json!({}), &mut driver, &mut session)
             .unwrap_err();
         assert!(error.to_string().contains("unknown goal request type"));
+    }
+
+    #[test]
+    fn goal_block_validates_dependency_and_preserves_goal() {
+        let mut session = persisted_session();
+        let mut driver = GoalDriver::new();
+        driver.start(&mut session, "ship it", None).unwrap();
+        let valid = json!({
+            "reason": "Need access", "waiting_on": "user",
+            "resume_when": "Access granted", "independent_work_remaining": false
+        });
+        for (field, value) in [
+            ("reason", json!(" ")),
+            ("waiting_on", json!("agent")),
+            ("resume_when", json!("")),
+            ("independent_work_remaining", json!(true)),
+        ] {
+            let mut payload = valid.clone();
+            payload[field] = value;
+            assert!(
+                handle_goal_host_request("goal.block", &payload, &mut driver, &mut session)
+                    .is_err()
+            );
+            assert_eq!(driver.state().status, GoalStatus::Active);
+        }
+        let response =
+            handle_goal_host_request("goal.block", &valid, &mut driver, &mut session).unwrap();
+        assert_eq!(
+            response.goal,
+            goal_host_response(driver.state(), false).goal
+        );
+        assert!(response.completion_budget_report.is_none());
+        assert!(handle_goal_host_request(
+            "goal.create",
+            &json!({"objective": "replacement"}),
+            &mut driver,
+            &mut session
+        )
+        .is_err());
+        let response =
+            handle_goal_host_request("goal.resume", &json!({}), &mut driver, &mut session).unwrap();
+        assert_eq!(response.goal.unwrap().status, GoalStatus::Active);
+        driver.pause(&mut session, "Paused by user").unwrap();
+        let paused = driver.state().clone();
+        let error = handle_goal_host_request("goal.resume", &json!({}), &mut driver, &mut session)
+            .unwrap_err();
+        assert!(error.to_string().contains("only resume a blocked goal"));
+        assert_eq!(driver.state(), &paused);
     }
 
     #[test]

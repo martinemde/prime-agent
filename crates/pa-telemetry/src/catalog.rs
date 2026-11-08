@@ -719,6 +719,8 @@ const AGENT_SESSION_ENDED: EventRule = EventRule {
         ("feature_goal_failed_count", optional(count())),
         ("feature_goal_canceled_count", optional(count())),
         ("feature_goal_unavailable_count", optional(count())),
+        ("feature_goal_blocked_count", optional(count())),
+        ("feature_goal_resumed_count", optional(count())),
         ("feature_new_initiated_count", optional(count())),
         ("feature_new_completed_count", optional(count())),
         ("feature_new_failed_count", optional(count())),
@@ -1056,6 +1058,8 @@ const TUI_EXIT: EventRule = EventRule {
         ("feature_goal_failed_count", optional(count())),
         ("feature_goal_canceled_count", optional(count())),
         ("feature_goal_unavailable_count", optional(count())),
+        ("feature_goal_blocked_count", optional(count())),
+        ("feature_goal_resumed_count", optional(count())),
         ("feature_new_initiated_count", optional(count())),
         ("feature_new_completed_count", optional(count())),
         ("feature_new_failed_count", optional(count())),
@@ -1270,8 +1274,10 @@ pub fn catalog() -> Vec<&'static EventRule> {
 /// in the fixed vocabulary (`None` outside it).
 #[must_use]
 pub fn feature_outcome_key(feature_name: &str, outcome: &str) -> Option<String> {
-    (FEATURE_NAMES.contains(&feature_name) && FEATURE_OUTCOMES.contains(&outcome))
-        .then(|| format!("feature_{feature_name}_{outcome}_count"))
+    (FEATURE_NAMES.contains(&feature_name)
+        && (FEATURE_OUTCOMES.contains(&outcome)
+            || (feature_name == "goal" && ["blocked", "resumed"].contains(&outcome))))
+    .then(|| format!("feature_{feature_name}_{outcome}_count"))
 }
 
 /// The `input_<stage>_*` key prefix for an input stage in the fixed
@@ -1465,6 +1471,12 @@ mod tests {
                 assert!(ended.properties.iter().any(|(known, _)| *known == key));
                 assert!(exit.properties.iter().any(|(known, _)| *known == key));
             }
+        }
+        for outcome in ["blocked", "resumed"] {
+            let key = feature_outcome_key("goal", outcome).unwrap();
+            assert!(ended.properties.iter().any(|(known, _)| *known == key));
+            assert!(exit.properties.iter().any(|(known, _)| *known == key));
+            assert_eq!(feature_outcome_key("model", outcome), None);
         }
         for stage in INPUT_STAGES {
             let prefix = input_stage_key(stage).unwrap();

@@ -462,8 +462,28 @@ impl Worker {
                     let sink_core = Arc::clone(&sink_core);
                     let sink_notify = Arc::clone(&sink_notify);
                     let sink_recovery = Arc::clone(&recovery);
+                    let sink_engine = Arc::downgrade(concrete);
                     std::sync::Arc::new(move |text| {
-                        admit_autonomous_follow_up(&sink_recovery, &sink_core, &sink_notify, text);
+                        admit_autonomous_follow_up(
+                            &sink_recovery,
+                            &sink_core,
+                            &sink_notify,
+                            text,
+                            || {
+                                sink_engine.upgrade().is_some_and(|engine| {
+                                    engine.current_goal_state().map_or_else(
+                                        || {
+                                            engine
+                                                .goal_runtime
+                                                .lock()
+                                                .expect("goal runtime lock")
+                                                .is_none()
+                                        },
+                                        |goal| goal.status != pa_core::goals::GoalStatus::Blocked,
+                                    )
+                                })
+                            },
+                        );
                     })
                 };
                 concrete.set_autonomous_admission(autonomous_sink);
@@ -520,12 +540,53 @@ impl Worker {
                             item.pending_handle.clone()
                         }
                     };
+                    let expected_status = match &work {
+                        crate::engine::GoalTurnEndWork::Continuation(_) => {
+                            pa_core::goals::GoalStatus::Active
+                        }
+                        crate::engine::GoalTurnEndWork::BudgetLimitSteer(_) => {
+                            pa_core::goals::GoalStatus::BudgetLimited
+                        }
+                    };
+                    let expected_goal_id = match &work {
+                        crate::engine::GoalTurnEndWork::Continuation(item)
+                        | crate::engine::GoalTurnEndWork::BudgetLimitSteer(item) => item
+                            .request
+                            .custom_message
+                            .as_ref()
+                            .and_then(|row| row["details"]["goalId"].as_str())
+                            .map(str::to_string),
+                    };
                     admit_goal_follow_up(
                         &sink_recovery,
                         &sink_core,
                         &sink_events,
                         &sink_notify,
                         work,
+                        |core| {
+                            sink_engine.upgrade().is_some_and(|engine| {
+                                let handles = engine.goal_runtime.lock().expect("goal runtime lock").clone();
+                                let Some(handles) = handles else { return false; };
+                                let Ok(driver) = handles.driver.try_lock() else { return false; };
+                                let goal = driver.state_with_creation_elapsed();
+                                if goal.status != expected_status || goal.goal_id != expected_goal_id {
+                                    return false;
+                                }
+                                // The core manager is in-memory. The worker owns
+                                // durable goal writes; retain the driver guard so
+                                // a block cannot interleave this Active snapshot.
+                                if let Some(store) = core.store.as_mut() {
+                                    if let Err(error) = store.persist_entry("custom", json!({
+                                        "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+                                        "data": goal,
+                                    })) {
+                                        eprintln!("pa-daemon: goal continuation persist failed: {error:#}");
+                                        return false;
+                                    }
+                                }
+                                true
+                            })
+                        },
                     );
                     if sink_engine.upgrade().is_none() {
                         return;
@@ -540,10 +601,24 @@ impl Worker {
                 let purge_recovery = Arc::clone(&recovery);
                 let purge_engine = Arc::downgrade(concrete);
                 let queue_purge: std::sync::Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                    if let Some(engine) = purge_engine.upgrade() {
+                        engine.cancel_goal_backoff_wake();
+                    }
                     {
                         let mut core = purge_core.lock().unwrap();
-                        core.steering.retain(|item| !is_goal_context_item(item));
-                        core.follow_up.retain(|item| !is_goal_context_item(item));
+                        let blocked = purge_engine
+                            .upgrade()
+                            .is_some_and(|engine| engine.goal_state_value()["status"] == "blocked");
+                        core.steering.retain(|item| {
+                            !(is_goal_context_item(item)
+                                || blocked
+                                    && item.queue_key.as_deref() == Some(AUTONOMOUS_QUEUE_KEY))
+                        });
+                        core.follow_up.retain(|item| {
+                            !(is_goal_context_item(item)
+                                || blocked
+                                    && item.queue_key.as_deref() == Some(AUTONOMOUS_QUEUE_KEY))
+                        });
                         if let Some(engine) = purge_engine.upgrade() {
                             clear_withdrawn_progress_note(&core, engine.as_ref());
                         }
@@ -1070,10 +1145,11 @@ impl pa_core::session_engine::rlm_usage::RlmChildUsageStore for CoreUsageStore {
 /// Whether one queued item is a minted goal-context turn (TS's
 /// `_clearQueuedGoalContexts` predicate on the injected custom row).
 fn is_goal_context_item(item: &QueuedItem) -> bool {
-    item.custom_message.as_ref().is_some_and(|row| {
-        row.get("customType").and_then(Value::as_str)
-            == Some(pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE)
-    })
+    item.message == pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT
+        || item.custom_message.as_ref().is_some_and(|row| {
+            row.get("customType").and_then(Value::as_str)
+                == Some(pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE)
+        })
 }
 
 /// Entry point for the worker process.

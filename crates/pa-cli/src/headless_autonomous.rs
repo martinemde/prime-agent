@@ -176,7 +176,9 @@ impl HeadlessAutonomous {
         }
         // An active goal's own continuation loop owns the wake-up: the
         // held turn is dropped behind it.
-        if engine.goal_owns_continuation_wakeup().await {
+        if engine.goal_owns_continuation_wakeup().await
+            || engine.goal_state().await.status == pa_types::goal::GoalStatus::Blocked
+        {
             return Ok(true);
         }
         let Some(message) = engine.latest_settled_assistant().await else {
@@ -204,6 +206,9 @@ impl HeadlessAutonomous {
     ) -> Result<bool, String> {
         let mut ran = false;
         while let Some(text) = self.held.lock().await.take() {
+            if engine.goal_state().await.status == pa_types::goal::GoalStatus::Blocked {
+                break;
+            }
             boundary
                 .admit_continuation(
                     engine,

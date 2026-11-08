@@ -4,21 +4,21 @@
 //! rules.
 
 use super::{now_millis, GoalDriver};
-use crate::goals::{GoalState, GoalStatus};
+use crate::goals::GoalState;
 use crate::session::manager::SessionManager;
 use crate::session_engine::provider_retry::provider_stream_failure_kind;
 
 /// How many consecutive no-output turns the mint tolerates before the
-/// goal finishes.
+/// goal blocks for explicit reassessment.
 pub(crate) const CONTINUATION_NO_PROGRESS_CAP: u32 = 3;
 
 /// The backoff base for consecutive no-output turns (10s, 20s, 40s ...):
 /// each retry of a no-progress continuation waits twice as long.
 pub(crate) const CONTINUATION_NO_PROGRESS_BACKOFF_BASE_MS: u64 = 10_000;
 
-/// The goal's terminal reason when the no-progress streak reaches the cap.
+/// The fallback blocker reason when repeated empty-output turns reach the cap.
 pub const CONTINUATION_NO_PROGRESS_CAP_REASON: &str =
-    "Goal continuation cap reached: consecutive turns made no progress";
+    "Goal continuation cap reached: consecutive turns produced no output; user reassessment is needed";
 
 /// The durable one-shot wake's cron label: the daemon's boundary sites arm a
 /// one-shot cron at [`GoalDriver::backoff_wake_at`], so the backoff retry actually runs.
@@ -113,7 +113,7 @@ impl GoalDriver {
             }
             if turn_produced_no_output(turn) {
                 // The turn produced no output: count it and arm the doubling
-                // backoff window; at the cap the goal finishes.
+                // backoff window; at the cap the goal blocks for reassessment.
                 self.counted_no_progress_turn_ms = Some(turn.timestamp);
                 self.no_progress_streak += 1;
                 self.no_progress_backoff_until_ms = now_millis()
@@ -130,18 +130,12 @@ impl GoalDriver {
                     },
                 )?;
                 if self.no_progress_streak >= CONTINUATION_NO_PROGRESS_CAP {
-                    let reason = CONTINUATION_NO_PROGRESS_CAP_REASON.to_string();
-                    self.set_state(
-                        session,
-                        GoalState {
-                            active: false,
-                            status: GoalStatus::Error,
-                            no_progress_streak: Some(self.no_progress_streak),
-                            last_reason: Some(reason.clone()),
-                            last_error: Some(reason),
-                            ..self.state.clone()
-                        },
-                    )?;
+                    self.block(session, pa_types::goal::GoalBlocker {
+                        reason: CONTINUATION_NO_PROGRESS_CAP_REASON.to_string(),
+                        waiting_on: pa_types::goal::GoalWaitingOn::User,
+                        resume_when: "The user reassesses the empty-output loop and explicitly resumes the goal".to_string(),
+                        independent_work_remaining: false,
+                    })?;
                     return Ok(false);
                 }
                 return Ok(false);

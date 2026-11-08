@@ -348,6 +348,11 @@ pub async fn create_session(mut config: SessionEngineConfig) -> anyhow::Result<S
     {
         session_counters.set_telemetry_enabled(telemetry_switch.enabled.clone());
     }
+    if config.telemetry.is_some() {
+        wiring
+            .runtime
+            .set_goal_telemetry_counters(session_counters.clone());
+    }
     // The `mcp.*` host requests (config/refresh/begin_login) the kernel's
     // generic MCP registry sends while listing or calling generic servers.
     // Telemetry counts connector use (never the server name) when the

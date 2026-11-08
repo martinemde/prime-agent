@@ -1753,8 +1753,8 @@ async fn run_prompts_and_emit(
     if !json_mode {
         let goal = engine.goal_state().await;
         let cap_reason = pa_core::session_engine::goal_driver::CONTINUATION_NO_PROGRESS_CAP_REASON;
-        if goal.status == pa_types::goal::GoalStatus::Error
-            && goal.last_error.as_deref() == Some(cap_reason)
+        if goal.status == pa_types::goal::GoalStatus::Blocked
+            && goal.last_reason.as_deref() == Some(cap_reason)
             && goal.updated_at != goal_updated_at_start
         {
             eprintln!("{cap_reason}");
