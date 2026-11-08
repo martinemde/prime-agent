@@ -27,10 +27,11 @@ pub type QueuedGoalContextPurge = Arc<dyn Fn() + Send + Sync>;
 /// Session-scoped runtime state the kernel bridge reaches.
 pub struct SessionRuntime {
     goal_driver: Arc<Mutex<GoalDriver>>,
+    goal_telemetry: Arc<std::sync::OnceLock<Arc<super::telemetry::SessionCounters>>>,
     cron_store: Option<Arc<AgentCronJobStore>>,
     active_session_id: String,
     binding: SessionBinding,
-    /// Invoked after a kernel `goal.complete` settles the goal; `None`
+    /// Invoked after a kernel `goal.complete` or `goal.block` stops goal work; `None`
     /// when the embedding owns no queued goal contexts.
     goal_complete_purge: Option<QueuedGoalContextPurge>,
     /// Invoked after a kernel `rlm_heartbeat.*` mutation; `None` when
@@ -52,6 +53,7 @@ impl SessionRuntime {
     ) -> Self {
         Self {
             goal_driver: Arc::new(Mutex::new(GoalDriver::load_persisted(session))),
+            goal_telemetry: Arc::default(),
             cron_store,
             active_session_id,
             binding,
@@ -60,7 +62,14 @@ impl SessionRuntime {
         }
     }
 
-    /// Set the post-completion purge seam (the daemon worker's queue purge).
+    pub(crate) fn set_goal_telemetry_counters(
+        &self,
+        counters: Arc<super::telemetry::SessionCounters>,
+    ) {
+        let _ = self.goal_telemetry.set(counters);
+    }
+
+    /// Set the goal-stop purge seam (the daemon worker's queue purge).
     pub fn set_goal_complete_purge(&mut self, purge: QueuedGoalContextPurge) {
         self.goal_complete_purge = Some(purge);
     }
@@ -92,13 +101,19 @@ impl SessionRuntime {
     ) {
         let driver = self.goal_driver.clone();
         let goal_session = session;
-        // TS `_completeGoalFromHost` clears the queued goal contexts: a continuation
-        // queued behind the completing turn never runs post-completion.
+        // A continuation queued behind a completing or blocked turn must not run.
         let goal_complete_purge = self.goal_complete_purge.clone();
-        for request_type in ["goal.get", "goal.create", "goal.complete"] {
+        for request_type in [
+            "goal.get",
+            "goal.create",
+            "goal.complete",
+            "goal.block",
+            "goal.resume",
+        ] {
             let driver = driver.clone();
             let session = goal_session.clone();
-            let purge = if request_type == "goal.complete" {
+            let goal_telemetry = self.goal_telemetry.clone();
+            let purge = if matches!(request_type, "goal.complete" | "goal.block") {
                 goal_complete_purge.clone()
             } else {
                 None
@@ -109,16 +124,33 @@ impl SessionRuntime {
                     let driver = driver.clone();
                     let session = session.clone();
                     let purge = purge.clone();
+                    let goal_telemetry = goal_telemetry.clone();
                     Box::pin(async move {
                         let response = {
                             let mut driver = driver.lock().await;
                             let mut session = session.lock().await;
-                            handle_goal_host_request(
+                            let previous_status = driver.state().status;
+                            let response = handle_goal_host_request(
                                 request_type,
                                 &payload.data,
                                 &mut driver,
                                 &mut session,
-                            )?
+                            )?;
+                            let status = driver.state().status;
+                            if status != previous_status {
+                                if let Some(counters) = goal_telemetry.get() {
+                                    match (request_type, status) {
+                                        ("goal.block", crate::goals::GoalStatus::Blocked) => {
+                                            counters.note_feature_outcome("goal", "blocked");
+                                        }
+                                        ("goal.resume", crate::goals::GoalStatus::Active) => {
+                                            counters.note_feature_outcome("goal", "resumed");
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            response
                         };
                         if let Some(purge) = purge {
                             purge();
@@ -209,9 +241,9 @@ mod tests {
         HostRequestPayload { data }
     }
 
-    /// The purge seam fires only for `goal.complete`, never on the way in.
+    /// Reads, creation and resume leave queues alone; successful stops purge them.
     #[tokio::test]
-    async fn goal_complete_purge_runs_only_after_goal_complete() {
+    async fn goal_stop_purge_runs_after_block_and_complete() {
         let session = Arc::new(Mutex::new(persisted_session()));
         let dir = tempfile::TempDir::new().unwrap();
         let mut runtime = SessionRuntime::new(
@@ -246,12 +278,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(purges.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let block = handlers.get("goal.block").unwrap().clone();
+        assert!(block(payload(serde_json::json!({ "type": "goal.block" })))
+            .await
+            .is_err());
+        assert_eq!(purges.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let response = block(payload(serde_json::json!({
+            "type": "goal.block", "reason": "Need a decision", "waiting_on": "user",
+            "resume_when": "User chooses an option", "independent_work_remaining": false
+        })))
+        .await
+        .unwrap();
+        assert_eq!(response["goal"]["status"], "blocked");
+        assert_eq!(purges.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let resume = handlers.get("goal.resume").unwrap().clone();
+        let response = resume(payload(serde_json::json!({ "type": "goal.resume" })))
+            .await
+            .unwrap();
+        assert_eq!(response["goal"]["status"], "active");
+        assert_eq!(purges.load(std::sync::atomic::Ordering::SeqCst), 1);
 
         let complete = handlers.get("goal.complete").unwrap().clone();
         complete(payload(serde_json::json!({ "type": "goal.complete" })))
             .await
             .unwrap();
-        assert_eq!(purges.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(purges.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

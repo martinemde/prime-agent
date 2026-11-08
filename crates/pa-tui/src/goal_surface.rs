@@ -2,7 +2,7 @@
 //! label. Pure state and formatting; the session view owns the
 //! transcript rows.
 
-use pa_types::goal::{empty_goal_state, GoalState, GoalStatus};
+use pa_types::goal::{empty_goal_state, GoalBlocker, GoalState, GoalStatus, GoalWaitingOn};
 
 /// The announcement dedupe snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,6 +12,7 @@ pub struct GoalAnnouncementSnapshot {
     pub objective: Option<String>,
     pub last_reason: Option<String>,
     pub last_error: Option<String>,
+    pub blocker: Option<GoalBlocker>,
 }
 
 impl Default for GoalAnnouncementSnapshot {
@@ -28,6 +29,7 @@ pub fn announcement_snapshot(goal: &GoalState) -> GoalAnnouncementSnapshot {
         objective: goal.objective.clone(),
         last_reason: goal.last_reason.clone(),
         last_error: goal.last_error.clone(),
+        blocker: goal.blocker.clone(),
     }
 }
 
@@ -51,6 +53,7 @@ pub fn should_announce(
             previous.last_reason != next.last_reason
         }
         GoalStatus::Error => previous.last_error != next.last_error,
+        GoalStatus::Blocked => previous.blocker != next.blocker,
     }
 }
 
@@ -88,6 +91,20 @@ pub fn format_goal_status(goal: &GoalState, columns: usize) -> String {
             ),
             None => "Goal paused (/goal resume)".to_string(),
         },
+        GoalStatus::Blocked => {
+            let prefix = blocked_goal_label(goal);
+            let detail = goal
+                .blocker
+                .as_ref()
+                .map(|blocker| format!("{}; resume when {}", blocker.reason, blocker.resume_when));
+            match detail {
+                Some(detail) => format!(
+                    "{prefix}{}",
+                    goal_detail_suffix(&detail, crate::width::str_width(prefix), columns)
+                ),
+                None => prefix.to_string(),
+            }
+        }
         GoalStatus::BudgetLimited => {
             let prefix = format!("Goal budget limited{usage_text}");
             match &goal.last_reason {
@@ -112,6 +129,14 @@ pub fn format_goal_status(goal: &GoalState, columns: usize) -> String {
             ),
             None => "Goal error".to_string(),
         },
+    }
+}
+
+fn blocked_goal_label(goal: &GoalState) -> &'static str {
+    match goal.blocker.as_ref().map(|blocker| blocker.waiting_on) {
+        Some(GoalWaitingOn::User) => "Goal blocked (waiting on user)",
+        Some(GoalWaitingOn::External) => "Goal blocked (waiting on external dependency)",
+        None => "Goal blocked",
     }
 }
 
@@ -145,6 +170,11 @@ pub fn tray_goal_label(goal: &GoalState) -> Option<String> {
     match goal.status {
         GoalStatus::Active => Some(format!(
             "Pursuing goal ({})",
+            format_goal_elapsed(goal.time_used_seconds)
+        )),
+        GoalStatus::Blocked => Some(format!(
+            "{} ({})",
+            blocked_goal_label(goal),
             format_goal_elapsed(goal.time_used_seconds)
         )),
         GoalStatus::Paused => Some(format!(
@@ -194,6 +224,7 @@ fn goal_status_word(status: GoalStatus) -> &'static str {
         GoalStatus::Idle => "idle",
         GoalStatus::Active => "active",
         GoalStatus::Paused => "paused",
+        GoalStatus::Blocked => "blocked",
         GoalStatus::BudgetLimited => "budget limited",
         GoalStatus::Complete => "complete",
         GoalStatus::Error => "error",
@@ -241,11 +272,42 @@ pub fn render_goal_panel(
     // width): at a narrow terminal the objective wraps tighter rather
     // than rendering rows the frame would silently truncate.
     let objective_width = width.saturating_sub(4).max(1);
+    let mut blocker_lines: Vec<Line> = Vec::new();
+    if let Some(blocker) = goal
+        .blocker
+        .as_ref()
+        .filter(|_| goal.status == GoalStatus::Blocked)
+    {
+        let waiting_on = match blocker.waiting_on {
+            GoalWaitingOn::User => "user",
+            GoalWaitingOn::External => "external dependency",
+        };
+        for detail in [
+            format!("Waiting on: {waiting_on}"),
+            format!("Reason: {}", blocker.reason),
+            format!("Resume when: {}", blocker.resume_when),
+            format!(
+                "Independent work remaining: {}",
+                if blocker.independent_work_remaining {
+                    "yes"
+                } else {
+                    "no"
+                }
+            ),
+        ] {
+            let detail: String = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+            for wrapped in crate::width::wrap_text(&detail, objective_width) {
+                let mut row = vec![Span::raw("  ")];
+                row.extend(wrapped);
+                blocker_lines.push(row);
+            }
+        }
+    }
     // The frame's fixed rows outside the objective block (10): the objective
     // renders in whatever the viewport budget leaves, clipping with a marker
     // (a multi-screen objective keeps its title and first lines instead of
     // front-cropping them away).
-    let fixed = 10;
+    let fixed = 10 + blocker_lines.len();
     let objective_budget = panel.viewport_rows.saturating_sub(fixed).max(1);
     let wrapped = crate::width::wrap_text(&objective, objective_width);
     let mut shown = wrapped.len().min(objective_budget);
@@ -293,6 +355,7 @@ pub fn render_goal_panel(
             "",
         ));
     }
+    lines.extend(blocker_lines);
     let close = kb.first_key("tui.select.cancel").map_or_else(
         || "Esc".to_string(),
         |key| crate::keybindings::format_key_text(&key),
@@ -453,6 +516,68 @@ mod tests {
         assert_eq!(
             tray_goal_label(&elapsed).as_deref(),
             Some("Pursuing goal (1h 01m)")
+        );
+    }
+
+    #[test]
+    fn blocked_goal_surfaces_show_dependency_and_announce_changes() {
+        let mut state = goal(GoalStatus::Blocked);
+        state.blocker = Some(GoalBlocker {
+            reason: "Approval needed".to_string(),
+            waiting_on: GoalWaitingOn::User,
+            resume_when: "release approved".to_string(),
+            independent_work_remaining: false,
+        });
+        assert_eq!(
+            format_goal_status(&state, 140),
+            "Goal blocked (waiting on user): Approval needed; resume when release approved"
+        );
+        assert_eq!(
+            tray_goal_label(&state).as_deref(),
+            Some("Goal blocked (waiting on user) (0s)")
+        );
+        let mut view = GoalView::new();
+        assert!(view.apply_update(state.clone()));
+        assert!(!view.apply_update(state.clone()));
+        state.blocker.as_mut().unwrap().waiting_on = GoalWaitingOn::External;
+        assert!(view.apply_update(state.clone()));
+        assert_eq!(
+            tray_goal_label(&state).as_deref(),
+            Some("Goal blocked (waiting on external dependency) (0s)")
+        );
+        let theme = crate::theme::Theme::builtin("prime", crate::theme::ColorMode::TrueColor);
+        let kb = crate::keybindings::KeybindingsManager::new();
+        let frame = render_goal_panel(
+            &GoalPanel {
+                goal: state,
+                viewport_rows: 40,
+            },
+            &theme,
+            80,
+            &kb,
+        );
+        let text: Vec<String> = frame
+            .iter()
+            .map(|line| line.iter().map(|span| span.content.as_str()).collect())
+            .collect();
+        let detail: Vec<&str> = text
+            .iter()
+            .map(|line| line.trim())
+            .filter(|line| {
+                line.starts_with("Waiting on:")
+                    || line.starts_with("Reason:")
+                    || line.starts_with("Resume when:")
+                    || line.starts_with("Independent work")
+            })
+            .collect();
+        assert_eq!(
+            detail,
+            vec![
+                "Waiting on: external dependency",
+                "Reason: Approval needed",
+                "Resume when: release approved",
+                "Independent work remaining: no",
+            ]
         );
     }
 

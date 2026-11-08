@@ -1,9 +1,8 @@
 //! Queued input: the item model, the lanes, admission, delivery batching,
 //! and queue recovery.
 use super::{
-    emit_worker_event_with, json, oneshot, Arc, Duration, EventPump, Mutex, Notify, Result,
-    SessionCore, Value, VecDeque, WorkerRecoveryJournal, AGENT_MESSAGE_SOURCE,
-    AUTONOMOUS_QUEUE_KEY,
+    json, oneshot, Arc, Duration, EventPump, Mutex, Notify, Result, SessionCore, Value, VecDeque,
+    WorkerRecoveryJournal, AGENT_MESSAGE_SOURCE, AUTONOMOUS_QUEUE_KEY,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -430,9 +429,13 @@ pub(crate) fn admit_autonomous_follow_up(
     core: &Arc<Mutex<SessionCore>>,
     work_notify: &Arc<Notify>,
     text: String,
+    can_admit: impl FnOnce() -> bool,
 ) {
     {
         let mut core = core.lock().unwrap();
+        if !can_admit() {
+            return;
+        }
         core.follow_up.push_back(QueuedItem {
             priority: QueuePriority::Background,
             preview: None,
@@ -466,28 +469,19 @@ pub(crate) fn admit_goal_follow_up(
     events: &Arc<EventPump>,
     work_notify: &Arc<Notify>,
     work: crate::engine::GoalTurnEndWork,
+    can_admit: impl FnOnce(&mut SessionCore) -> bool,
 ) {
     let (lane, follow_up) = match work {
         crate::engine::GoalTurnEndWork::BudgetLimitSteer(follow_up) => (Lane::Steering, follow_up),
         crate::engine::GoalTurnEndWork::Continuation(follow_up) => (Lane::FollowUp, follow_up),
     };
-    if let Some(goal) = &follow_up.goal_update {
-        {
-            let mut guard = core.lock().unwrap();
-            if let Some(store) = guard.store.as_mut() {
-                let _ = store.persist_entry(
-                    "custom",
-                    json!({
-                        "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
-                        "data": goal,
-                    }),
-                );
-            }
-        }
-        emit_worker_event_with(core, events, json!({ "type": "goal_update", "goal": goal }));
-    }
     {
         let mut core = core.lock().unwrap();
+        // Share the purge's lock: work minted before a block cannot arrive
+        // after its purge or write an obsolete active state over the blocker.
+        if !can_admit(&mut core) {
+            return;
+        }
         let item = QueuedItem {
             priority: QueuePriority::Background,
             preview: None,
@@ -505,6 +499,15 @@ pub(crate) fn admit_goal_follow_up(
         match lane {
             Lane::Steering => enqueue_priority(&mut core.steering, item),
             Lane::FollowUp => enqueue_priority(&mut core.follow_up, item),
+        }
+        if let Some(goal) = &follow_up.goal_update {
+            // The block's purge shares this lock, so its Blocked event cannot
+            // be followed by this older mint's Active event.
+            super::emit_worker_event_locked(
+                &mut core,
+                events,
+                json!({ "type": "goal_update", "goal": goal }),
+            );
         }
     }
     // The admission checkpoint: same idle-admission gap as the

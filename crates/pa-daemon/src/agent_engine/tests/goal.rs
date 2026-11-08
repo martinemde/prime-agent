@@ -1240,3 +1240,97 @@ fn shared_window_goal_seed_matches_persisted_goal_state() {
         );
     }
 }
+
+#[test]
+fn blocked_recovery_rejects_stale_goal_turns_without_resuming_on_user_input() {
+    let _faux = FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut store = crate::session_store::SessionFile::create("/tmp", None, 0);
+    let path = dir.path().join("session.jsonl");
+    store.set_path(path.clone());
+    let blocked = json!({
+        "status": "blocked", "active": false, "goalId": "goal-1", "objective": "ship",
+        "tokensUsed": 0, "timeUsedSeconds": 0, "continuationsUsed": 0,
+        "blocker": {"reason": "Need approval", "waitingOn": "user", "resumeWhen": "Approved", "independentWorkRemaining": false}
+    });
+    store.append_entry(
+        "custom",
+        json!({"customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE, "data": blocked}),
+    );
+    store.rewrite().unwrap();
+    assert_eq!(
+        crate::goal_state_persist::persisted_goal_state(Some(&path))
+            .unwrap()
+            .status,
+        pa_core::goals::GoalStatus::Blocked
+    );
+    let engine = Arc::new(
+        AgentSessionEngine::new(AgentEngineConfig {
+            cwd: dir.path().to_path_buf(),
+            agent_dir: dir.path().join("agent"),
+            provider: None,
+            model: None,
+            api_key: None,
+            thinking: None,
+            session_dir: None,
+            session_file: Some(path.clone()),
+            faux_script: Some(json!({"responses": [{"text": "unrelated reply"}]}).to_string()),
+            supervisor_link: None,
+            telemetry_disabled: None,
+            cron_store: None,
+            queued_steering_probe: None,
+        })
+        .unwrap(),
+    );
+    let work = goal_admission_collector(&engine);
+    for custom_message in [
+        Some(
+            json!({"role": "custom", "customType": "goal_context", "content": "stale continuation", "display": true, "timestamp": 0}),
+        ),
+        None,
+    ] {
+        let mut events = Vec::new();
+        engine.run_prompt(
+            0,
+            PromptRequest {
+                batch: Vec::new(),
+                message: if custom_message.is_some() {
+                    "stale continuation".to_string()
+                } else {
+                    pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT.to_string()
+                },
+                images: Vec::new(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message,
+            },
+            &|| false,
+            &mut |event| {
+                events.push(event);
+                true
+            },
+        );
+        assert_eq!(
+            events.len(),
+            1,
+            "a stale recovered turn must not emit an accepted row or call the provider: {events:?}"
+        );
+        assert!(matches!(events[0], EngineEvent::Done(Ok(()))));
+    }
+    let mut events = Vec::new();
+    admit(&engine, "an unrelated question".to_string(), &mut events);
+    assert_eq!(
+        assistant_texts(&events),
+        vec!["unrelated reply".to_string()]
+    );
+    assert_eq!(engine.goal_state_value()["status"], "blocked");
+    assert!(work.lock().unwrap().is_empty());
+    assert_eq!(
+        crate::goal_state_persist::persisted_goal_state(Some(&path))
+            .unwrap()
+            .status,
+        pa_core::goals::GoalStatus::Blocked
+    );
+}

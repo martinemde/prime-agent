@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 /// the newest ACTIVE streak-3 row.
 fn session_rows_with_reverted_terminal(session: &mut SessionManager) -> GoalState {
     let mut state = session.active_goal_state().unwrap_or_else(empty_goal_state);
-    if state.status == GoalStatus::Error {
+    if state.status == GoalStatus::Blocked {
         state = GoalState {
             active: true,
             status: GoalStatus::Active,
@@ -469,14 +469,14 @@ fn no_output_turns_count_to_the_cap_and_backoff() {
             .unwrap()
             .is_none());
     }
-    assert_eq!(driver.state().status, GoalStatus::Error);
+    assert_eq!(driver.state().status, GoalStatus::Blocked);
     assert_eq!(
         driver.state().last_reason.as_deref(),
-        Some("Goal continuation cap reached: consecutive turns made no progress")
+        Some(CONTINUATION_NO_PROGRESS_CAP_REASON)
     );
     assert_eq!(
         GoalDriver::load_persisted(&session).state().status,
-        GoalStatus::Error
+        GoalStatus::Blocked
     );
 }
 
@@ -804,7 +804,7 @@ fn the_rate_limit_refusal_sticks_across_reconsults() {
 }
 
 #[test]
-fn a_restored_goal_at_the_cap_finishes_at_the_first_consult() {
+fn a_restored_goal_at_the_cap_blocks_at_the_first_consult() {
     let mut session = persisted_session();
     let mut driver = GoalDriver::new();
     driver.start(&mut session, "work", None).unwrap();
@@ -815,7 +815,7 @@ fn a_restored_goal_at_the_cap_finishes_at_the_first_consult() {
             .next_continuation_message(&mut session, Some(&empty))
             .unwrap();
     }
-    assert_eq!(driver.state().status, GoalStatus::Error);
+    assert_eq!(driver.state().status, GoalStatus::Blocked);
     // Simulate the interrupted terminal transition: the streak-3
     // Active row stays newest.
     let rows = session_rows_with_reverted_terminal(&mut session);
@@ -826,10 +826,10 @@ fn a_restored_goal_at_the_cap_finishes_at_the_first_consult() {
         .next_continuation_message(&mut session, Some(&test_empty_turn(created_at as i64 + 3)))
         .unwrap()
         .is_none());
-    assert_eq!(driver.state().status, GoalStatus::Error);
+    assert_eq!(driver.state().status, GoalStatus::Blocked);
     assert_eq!(
         driver.state().last_reason.as_deref(),
-        Some("Goal continuation cap reached: consecutive turns made no progress")
+        Some(CONTINUATION_NO_PROGRESS_CAP_REASON)
     );
 }
 
@@ -961,6 +961,66 @@ fn rollback_continuation_mint_restores_the_count() {
 }
 
 #[test]
+fn blocked_goal_survives_restore_and_only_explicit_resume_reactivates_it() {
+    let mut session = persisted_session();
+    let mut driver = GoalDriver::new();
+    driver.start(&mut session, "ship it", Some(1000)).unwrap();
+    driver
+        .record_assistant_usage(&mut session, "before", &usage(12, 3))
+        .unwrap();
+    driver.mark_continuation_owed();
+    let before = driver.state().clone();
+    let blocker = pa_types::goal::GoalBlocker {
+        reason: "Need account access".to_string(),
+        waiting_on: pa_types::goal::GoalWaitingOn::User,
+        resume_when: "User grants account access".to_string(),
+        independent_work_remaining: false,
+    };
+    driver.block(&mut session, blocker.clone()).unwrap();
+    let expected = GoalState {
+        active: false,
+        status: GoalStatus::Blocked,
+        blocker: Some(blocker),
+        last_reason: Some("Need account access".to_string()),
+        updated_at: driver.state().updated_at,
+        time_used_seconds: driver.state().time_used_seconds,
+        ..before
+    };
+    assert_eq!(driver.state(), &expected);
+    assert!(!driver.owes_continuation());
+    assert!(!driver.pending_continuation());
+    let mut driver = GoalDriver::load_persisted(&session);
+    assert_eq!(driver.state(), &expected);
+    assert!(driver
+        .next_continuation_message(&mut session, None)
+        .unwrap()
+        .is_none());
+    assert!(driver.backoff_wake_at().is_none());
+    assert_eq!(
+        driver
+            .record_assistant_usage(&mut session, "unrelated", &usage(99, 1))
+            .unwrap(),
+        UsageOutcome::Ignored
+    );
+    driver.pause(&mut session, "unrelated input").unwrap();
+    assert_eq!(driver.state(), &expected);
+    assert!(driver.resume(&mut session).unwrap().is_some());
+    assert_eq!(
+        driver.state(),
+        &GoalState {
+            active: true,
+            status: GoalStatus::Active,
+            blocker: None,
+            last_reason: None,
+            no_progress_streak: Some(0),
+            updated_at: driver.state().updated_at,
+            time_used_seconds: driver.state().time_used_seconds,
+            ..expected
+        }
+    );
+}
+
+#[test]
 fn resume_resolves_the_existing_goal() {
     let mut session = persisted_session();
     let mut driver = GoalDriver::new();
@@ -1004,6 +1064,7 @@ fn restore_persisted_adopts_the_state_without_rewriting_it() {
         updated_at: Some(2),
         last_reason: None,
         last_error: None,
+        blocker: None,
     };
     let driver = GoalDriver::restore_persisted(state);
     assert_eq!(driver.state().status, GoalStatus::Active);

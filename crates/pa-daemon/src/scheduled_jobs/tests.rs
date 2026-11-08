@@ -441,3 +441,80 @@ async fn rlm_heartbeat_mutation_hook_fires_into_the_session_queue() {
     assert_eq!(details["status"], "active");
     assert_eq!(details["runCount"], 0);
 }
+
+#[tokio::test]
+async fn blocked_goal_backoff_fire_and_cancelled_claim_are_skipped() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let session = write_active_session(dir.path());
+    let store = Arc::new(AgentCronJobStore::new(dir.path().join("jobs.json")));
+    let core = Arc::new(Mutex::new(crate::worker::SessionCore::test_core(
+        None,
+        "/w".to_string(),
+    )));
+    let hooks = QueueHooks {
+        core: Arc::clone(&core),
+        work_notify: Arc::new(Notify::new()),
+        user_bash: Arc::new(crate::user_bash::UserBash::new()),
+        store: Arc::clone(&store),
+        recovery: Arc::new(Mutex::new(None)),
+    };
+    let job = store
+        .create(&CreateAgentCronJobInput {
+            active_session_id: session.0.clone(),
+            session_id: session.0.clone(),
+            session_file: session.1.to_string_lossy().to_string(),
+            cwd: "/w".to_string(),
+            source: Some("goal_backoff_wake".to_string()),
+            label: Some(
+                pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_CRON_LABEL.to_string(),
+            ),
+            prompt: pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT.to_string(),
+            schedule_text: "every 10s".to_string(),
+            now: Some(1),
+            ..Default::default()
+        })
+        .unwrap();
+    let mut persisted = crate::session_store::SessionFile::open(&session.1).unwrap();
+    persisted
+        .persist_entry(
+            "custom",
+            json!({"customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+        "data": {"status": "blocked", "active": false, "goalId": "g", "objective": "ship", "tokensUsed": 0, "timeUsedSeconds": 0, "continuationsUsed": 0,
+            "blocker": {"reason": "Need approval", "waitingOn": "user", "resumeWhen": "Approved", "independentWorkRemaining": false}}}),
+        )
+        .unwrap();
+    let goal = crate::goal_state_persist::persisted_goal_state(Some(&session.1)).unwrap();
+    assert_eq!(goal.status, pa_core::goals::GoalStatus::Blocked);
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), hooks.run_job(&job))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some("skipped")
+    );
+    assert_eq!(store.list()[0].status, JobStatus::Cancelled);
+    // The scheduler already claimed this Active snapshot. Cancellation of the
+    // live record must win even if an old Active goal row was read before it.
+    persisted
+        .persist_entry(
+            "custom",
+            json!({"customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE,
+        "data": {"status": "active", "active": true, "goalId": "g", "objective": "ship", "tokensUsed": 0, "timeUsedSeconds": 0, "continuationsUsed": 0}}),
+        )
+        .unwrap();
+    assert_eq!(
+        crate::goal_state_persist::persisted_goal_state(Some(&session.1))
+            .unwrap()
+            .status,
+        pa_core::goals::GoalStatus::Active
+    );
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(1), hooks.run_job(&job))
+            .await
+            .unwrap()
+            .unwrap(),
+        Some("skipped")
+    );
+    let core = core.lock().unwrap();
+    assert!(core.follow_up.is_empty() && core.steering.is_empty());
+}

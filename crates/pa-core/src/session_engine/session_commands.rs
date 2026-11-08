@@ -393,6 +393,9 @@ async fn execute_goal(
     // the action), counted as `feature_goal_completed_count`.
     if let Some(telemetry) = engine.telemetry.as_ref() {
         telemetry.note_feature_outcome("goal", "completed", Some(goal_choice));
+        if goal_choice == "resume" && execution.continuation_message.is_some() {
+            telemetry.note_feature_outcome("goal", "resumed", Some(goal_choice));
+        }
     }
     Ok(())
 }

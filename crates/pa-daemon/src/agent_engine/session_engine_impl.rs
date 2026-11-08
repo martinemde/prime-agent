@@ -13,6 +13,7 @@ use super::{
 impl SessionEngine for AgentSessionEngine {
     /// Withdraw the queued minted goal-context turns so a state change leaves nothing stale to run.
     fn purge_queued_goal_contexts(&self) {
+        self.cancel_goal_backoff_wake();
         let purge = self
             .goal_queue_purge
             .lock()
@@ -1332,6 +1333,41 @@ impl SessionEngine for AgentSessionEngine {
         emit: &mut dyn FnMut(EngineEvent) -> bool,
     ) {
         let mut emit = self.goal_tracking_emit(emit);
+        let goal_context = request
+            .custom_message
+            .as_ref()
+            .is_some_and(|row| row["customType"] == pa_core::goals::GOAL_CONTEXT_CUSTOM_TYPE);
+        let goal_wake =
+            request.message == pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT;
+        if goal_context || goal_wake {
+            // Queue recovery and a fire already picked up by the runner can
+            // outlive a block's purge. Consult the durable state before even
+            // emitting the accepted row, including before the lazy build.
+            let handles = self.goal_runtime.lock().expect("goal runtime lock").clone();
+            let state =
+                if let Some(handles) = handles {
+                    Some(self.runtime.block_on(async {
+                        handles.driver.lock().await.state_with_creation_elapsed()
+                    }))
+                } else {
+                    let path = self.session_file.lock().expect("session file lock").clone();
+                    crate::goal_state_persist::persisted_goal_state(path.as_deref())
+                };
+            if !state.is_some_and(|goal| {
+                let same_goal = request
+                    .custom_message
+                    .as_ref()
+                    .and_then(|row| row["details"]["goalId"].as_str())
+                    .is_none_or(|id| goal.goal_id.as_deref() == Some(id));
+                same_goal
+                    && (goal.status == pa_core::goals::GoalStatus::Active
+                        || (goal_context
+                            && goal.status == pa_core::goals::GoalStatus::BudgetLimited))
+            }) {
+                emit(EngineEvent::Done(Ok(())));
+                return;
+            }
+        }
         // The accepted-turn row carries the skill-expanded text (the
         // transcript renders the skill card).
         if request.message.starts_with("/skill:") {

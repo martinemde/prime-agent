@@ -54,6 +54,22 @@ impl TurnRunner {
                     self.idle_notify.notify_waiters();
                     return;
                 }
+                // Recovered autonomous work must not resume a durable blocked goal.
+                let blocked = engine.goal_state_value()["status"] == "blocked"
+                    || core.store.as_ref().is_some_and(|store| {
+                        crate::goal_state_persist::goal_state_in_session_file(store)
+                            .is_some_and(|goal| goal.status == pa_core::goals::GoalStatus::Blocked)
+                    });
+                if blocked {
+                    core.steering.retain(|item| {
+                        item.queue_key.as_deref()
+                            != Some(crate::autonomous_continuation::AUTONOMOUS_QUEUE_KEY)
+                    });
+                    core.follow_up.retain(|item| {
+                        item.queue_key.as_deref()
+                            != Some(crate::autonomous_continuation::AUTONOMOUS_QUEUE_KEY)
+                    });
+                }
                 // A cleared suspension alone must not admit: a manual
                 // compaction is a busy state the resume sites do NOT clear.
                 if self.input_pauses.paused() || core.queued_input_suspended || core.compacting {

@@ -101,6 +101,15 @@ impl AgentCronSchedulerHooks for QueueHooks {
             self.cancel_jobs_for_dead_target(job)?;
             return Ok(Some("skipped"));
         }
+        let goal_wake = job.label.as_deref()
+            == Some(pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_CRON_LABEL);
+        if goal_wake
+            && !crate::goal_state_persist::persisted_goal_state(Some(Path::new(&job.session_file)))
+                .is_some_and(|goal| goal.status == pa_core::goals::GoalStatus::Active)
+        {
+            self.store.cancel(&job.id, crate::util::now_ms())?;
+            return Ok(Some("skipped"));
+        }
         let activity = self.activity();
         if should_defer_heartbeat_cron_job(job, &activity) {
             return Ok(Some("skipped"));
@@ -116,7 +125,16 @@ impl AgentCronSchedulerHooks for QueueHooks {
                 .core
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !core.created || core.shutdown_requested || job.status != JobStatus::Active {
+            if !core.created
+                || core.shutdown_requested
+                || job.status != JobStatus::Active
+                // Cancellation precedes the queue purge. Re-read under its lock
+                // so an already-claimed wake cannot enqueue after that purge.
+                || (goal_wake
+                    && !self.store.list().iter().any(|stored| {
+                        stored.id == job.id && stored.status == JobStatus::Active
+                    }))
+            {
                 return Ok(Some("skipped"));
             }
             // TS cron fires resume the suspension before admission (`resumeIfIdle: true`): a

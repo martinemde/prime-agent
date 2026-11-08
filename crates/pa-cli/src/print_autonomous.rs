@@ -57,9 +57,9 @@ pub(crate) fn wire_continuation_hook(
                 .natural_continuation(&engine, &model, unsettled_rlm_work)
                 .await
             {
-                NaturalContinuation::QueuedInput | NaturalContinuation::RequestedCompaction => {
-                    Ok(Vec::new())
-                }
+                NaturalContinuation::QueuedInput
+                | NaturalContinuation::RequestedCompaction
+                | NaturalContinuation::Blocked => Ok(Vec::new()),
                 NaturalContinuation::ThresholdDue => {
                     // Unsettled inline-subagent work holds the mint (the
                     // daemon checks it before the threshold arm): the

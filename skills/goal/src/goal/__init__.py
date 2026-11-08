@@ -1,6 +1,6 @@
 """Prime Agent goal skill: manage the persistent thread goal from the kernel.
 
-All goal state lives in the TypeScript host; these functions are thin typed
+All goal state lives in the host; these functions are thin typed
 wrappers over the generic host bridge (`rlm.host_request`). They only work
 inside the Prime Agent Python kernel.
 """
@@ -25,7 +25,7 @@ async def get() -> dict[str, Any]:
 async def create(objective: str, token_budget: int | None = None) -> dict[str, Any]:
     """Start a new active thread goal.
 
-    Fails while a goal is still pending (active, paused, or budget-limited);
+    Fails while a goal is still pending (active, blocked, paused, or budget-limited);
     a completed or errored goal is replaced. Only create a goal when the user
     or system/developer instructions explicitly ask for a persistent
     long-running goal. Set `token_budget` only when an explicit token budget is
@@ -46,7 +46,47 @@ async def complete() -> dict[str, Any]:
 
     Use only when the objective has actually been achieved and no required
     work remains — not because the budget is nearly exhausted or because you
-    are stopping work. Pause, resume, and budget-limit transitions are
-    controlled by the user and the host.
+    are stopping work. Pause and budget-limit transitions are controlled by the user and the host.
     """
     return await host_request("goal.complete")
+
+
+async def block(
+    reason: str,
+    waiting_on: str,
+    resume_when: str,
+    independent_work_remaining: bool = False,
+) -> dict[str, Any]:
+    """Record a user or external dependency without claiming completion.
+
+    Use only when required work cannot proceed until that dependency is
+    satisfied. Describe its reason and the concrete condition for resuming.
+    """
+    if not isinstance(reason, str):
+        raise TypeError(f"reason must be str, got {type(reason).__name__}")
+    if waiting_on not in ("user", "external"):
+        raise ValueError("waiting_on must be 'user' or 'external'")
+    if not isinstance(resume_when, str):
+        raise TypeError(f"resume_when must be str, got {type(resume_when).__name__}")
+    if not isinstance(independent_work_remaining, bool):
+        raise TypeError("independent_work_remaining must be bool")
+    return await host_request(
+        "goal.block",
+        {
+            "reason": reason,
+            "waiting_on": waiting_on,
+            "resume_when": resume_when,
+            "independent_work_remaining": independent_work_remaining,
+        },
+    )
+
+
+async def resume() -> dict[str, Any]:
+    """Resume a blocked goal only after its dependency is explicitly satisfied.
+
+    Unrelated user input or elapsed time alone does not satisfy a dependency.
+    The host's consecutive-empty-output cap can also block a goal; it is a
+    fallback safeguard, not a semantic progress evaluator. Reassess its
+    recorded blocker before resuming.
+    """
+    return await host_request("goal.resume")

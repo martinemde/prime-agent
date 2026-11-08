@@ -494,3 +494,126 @@ async fn compact_mint_persists_the_goal_state_row() {
     assert_eq!(rows[0]["data"]["continuationsUsed"], 1);
     assert_eq!(rows[0]["data"]["objective"], "ship the port");
 }
+
+#[allow(clippy::await_holding_lock)] // faux registry is process-global
+#[tokio::test]
+async fn blocked_goal_withdraws_queued_wake_and_rejects_a_late_minted_continuation() {
+    let _faux = crate::agent_engine::tests::FAUX_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::TempDir::new().unwrap();
+    let worker = Arc::new(Worker::new(
+        WorkerConfig {
+            socket_path: dir.path().join("worker.sock"),
+            supervisor_socket_path: PathBuf::new(),
+            token: "token".to_string(),
+            worker_instance_id: String::new(),
+            active_session_id: "late-goal".to_string(),
+            agent_dir: dir.path().join("agent"),
+            recovery_journal_path: dir.path().join("recovery.jsonl"),
+            telemetry_disabled: None,
+            script: Some(json!({"engine": "faux", "responses": ["ready"]})),
+        },
+        None,
+    ));
+    assert!(
+        worker
+            .dispatch("create", &json!({"cwd": dir.path(), "name": "late-goal"}))
+            .await
+            .success
+    );
+    assert!(
+        worker
+            .dispatch("prompt_and_wait", &json!({"message": "initialize"}))
+            .await
+            .success
+    );
+    let engine = worker.agent_engine.as_ref().unwrap();
+    let handles = engine.goal_runtime.lock().unwrap().clone().unwrap();
+    let stale = {
+        let mut driver = handles.driver.lock().await;
+        let mut session = handles.session.lock().await;
+        driver.start(&mut session, "ship", None).unwrap();
+        let message = driver
+            .next_continuation_message(&mut session, None)
+            .unwrap()
+            .unwrap();
+        crate::engine::GoalContinuation {
+            request: PromptRequest {
+                batch: Vec::new(),
+                images: Vec::new(),
+                message: message.content.text(),
+                source: "user".to_string(),
+                agent_message_id: None,
+                custom_message: Some(crate::session_commands::custom_message_value(&message)),
+            },
+            goal_update: Some(serde_json::to_value(driver.state()).unwrap()),
+            pending_handle: Some(driver.pending_continuation_handle()),
+        }
+    };
+    let sink = engine.goal_admission_sink.lock().unwrap().clone().unwrap();
+    {
+        let mut core = worker.core.lock().unwrap();
+        core.queued_input_suspended = true;
+        core.follow_up.push_back(QueuedItem {
+            message: pa_core::session_engine::goal_driver::GOAL_BACKOFF_WAKE_MARKER_TEXT
+                .to_string(),
+            priority: QueuePriority::Background,
+            preview: None,
+            custom_message: None,
+            agent_message: None,
+            queue_key: None,
+            admission_id: None,
+            images: Vec::new(),
+            done: None,
+            queue_visible: false,
+            policy: TurnPolicy::Injected,
+            forced_batch: false,
+        });
+    }
+    {
+        let mut driver = handles.driver.lock().await;
+        let mut session = handles.session.lock().await;
+        driver
+            .block(
+                &mut session,
+                pa_types::goal::GoalBlocker {
+                    reason: "Need approval".to_string(),
+                    waiting_on: pa_types::goal::GoalWaitingOn::User,
+                    resume_when: "Approved".to_string(),
+                    independent_work_remaining: false,
+                },
+            )
+            .unwrap();
+    }
+    // Model turns mirror GoalUpdate into the worker-owned durable file.
+    // This test mutates the driver directly, so apply that same mirror here.
+    {
+        let goal = engine.goal_state_value();
+        let mut core = worker.core.lock().unwrap();
+        core.store
+            .as_mut()
+            .unwrap()
+            .persist_entry(
+                "custom",
+                json!({
+                    "customType": pa_core::goals::GOAL_STATE_CUSTOM_TYPE, "data": goal,
+                }),
+            )
+            .unwrap();
+    }
+    engine.purge_queued_goal_contexts();
+    // The mint finished before the block, but its sink delivery arrives after
+    // the purge. It must neither enqueue nor replace the durable Blocked row.
+    sink(crate::engine::GoalTurnEndWork::Continuation(stale));
+    let core = worker.core.lock().unwrap();
+    assert!(core.steering.is_empty() && core.follow_up.is_empty());
+    let path = core.store.as_ref().unwrap().path.clone();
+    drop(core);
+    assert_eq!(
+        crate::goal_state_persist::persisted_goal_state(Some(&path))
+            .unwrap()
+            .status,
+        pa_core::goals::GoalStatus::Blocked
+    );
+}

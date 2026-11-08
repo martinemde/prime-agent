@@ -60,6 +60,7 @@ async fn idle_time_injected_admission_is_busy_evidence() {
         &worker.core,
         &notify,
         "continue the mission".to_string(),
+        || true,
     );
     assert!(
         WorkerRecoveryJournal::read_interrupted(&worker.config.recovery_journal_path),

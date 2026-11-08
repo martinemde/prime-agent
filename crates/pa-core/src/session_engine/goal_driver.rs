@@ -255,6 +255,7 @@ impl GoalDriver {
             updated_at: Some(now),
             last_reason: None,
             last_error: None,
+            blocker: None,
         };
         let previous_accounted = std::mem::take(&mut self.accounted_messages);
         let previous_owed = self.owed_continuation_for_rlm_work;
@@ -447,7 +448,53 @@ impl GoalDriver {
         Ok(())
     }
 
-    /// Resume a paused/budget-limited goal. Returns the continuation context
+    /// Suspend an active goal on a concrete dependency, without completing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid blocker details, a non-active goal, or failed persistence.
+    pub fn block(
+        &mut self,
+        session: &mut SessionManager,
+        mut blocker: pa_types::goal::GoalBlocker,
+    ) -> anyhow::Result<()> {
+        blocker.reason = blocker.reason.trim().to_string();
+        blocker.resume_when = blocker.resume_when.trim().to_string();
+        if blocker.reason.is_empty() || blocker.resume_when.is_empty() {
+            anyhow::bail!("goal.block reason and resume_when must not be empty");
+        }
+        if blocker.independent_work_remaining {
+            anyhow::bail!("cannot block a goal while independent work remains");
+        }
+        if self.state.status != GoalStatus::Active {
+            anyhow::bail!("only an active goal can be blocked");
+        }
+        let billed_tokens = self
+            .billed_tokens
+            .swap(0, std::sync::atomic::Ordering::SeqCst);
+        let persisted = self.set_state(
+            session,
+            GoalState {
+                status: GoalStatus::Blocked,
+                tokens_used: self.state.tokens_used + billed_tokens,
+                last_reason: Some(blocker.reason.clone()),
+                last_error: None,
+                blocker: Some(blocker),
+                ..self.state.clone()
+            },
+        );
+        if let Err(error) = persisted {
+            self.billed_tokens
+                .fetch_add(billed_tokens, std::sync::atomic::Ordering::SeqCst);
+            return Err(error);
+        }
+        self.owed_continuation_for_rlm_work = false;
+        self.no_progress_backoff_until_ms = 0;
+        self.parked_refusal_until_ms = 0;
+        Ok(())
+    }
+
+    /// Resume a paused, blocked, or budget-limited goal. Returns the continuation context
     /// message when the goal becomes active again.
     ///
     /// # Errors
@@ -462,7 +509,7 @@ impl GoalDriver {
         }
         if !matches!(
             self.state.status,
-            GoalStatus::Paused | GoalStatus::BudgetLimited
+            GoalStatus::Paused | GoalStatus::Blocked | GoalStatus::BudgetLimited
         ) {
             return Ok(None);
         }
@@ -484,9 +531,15 @@ impl GoalDriver {
                 // stays budget_limited); a live resume clears it.
                 last_reason: exhausted.then(|| "Goal token budget already reached".to_string()),
                 last_error: None,
+                blocker: None,
+                no_progress_streak: Some(0),
                 ..self.state.clone()
             },
         )?;
+        self.no_progress_streak = 0;
+        self.no_progress_backoff_until_ms = 0;
+        self.parked_refusal_until_ms = 0;
+        self.owed_continuation_for_rlm_work = false;
         if next_status == GoalStatus::Active {
             // Calls billed while the goal was paused never charge it.
             self.billed_tokens
@@ -515,6 +568,7 @@ impl GoalDriver {
             GoalState {
                 active: false,
                 status: GoalStatus::Complete,
+                blocker: None,
                 last_reason: Some("Goal achieved".to_string()),
                 last_error: None,
                 ..self.state.clone()
@@ -579,20 +633,19 @@ impl GoalDriver {
         }
 
         // The cap enforcement is UNCONDITIONAL: a restored goal already
-        // at the cap finishes at the FIRST consult.
+        // at the cap blocks at the FIRST consult.
         if self.state.status == GoalStatus::Active
             && self.no_progress_streak >= CONTINUATION_NO_PROGRESS_CAP
         {
-            let reason = progress::CONTINUATION_NO_PROGRESS_CAP_REASON.to_string();
-            self.set_state(
+            self.block(
                 session,
-                GoalState {
-                    active: false,
-                    status: GoalStatus::Error,
-                    no_progress_streak: Some(self.no_progress_streak),
-                    last_reason: Some(reason.clone()),
-                    last_error: Some(reason),
-                    ..self.state.clone()
+                pa_types::goal::GoalBlocker {
+                    reason: progress::CONTINUATION_NO_PROGRESS_CAP_REASON.to_string(),
+                    waiting_on: pa_types::goal::GoalWaitingOn::User,
+                    resume_when:
+                        "The user reassesses the empty-output loop and explicitly resumes the goal"
+                            .to_string(),
+                    independent_work_remaining: false,
                 },
             )?;
             return Ok(None);

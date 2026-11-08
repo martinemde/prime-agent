@@ -1,0 +1,1 @@
+- Incomplete goals can now wait on user input or external dependencies without repeated automatic continuation wakes, then resume with their progress intact.

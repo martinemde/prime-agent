@@ -284,6 +284,11 @@ impl AgentSessionEngine {
         let last_turn = self.last_loop_assistant_message();
         self.runtime.block_on(async {
             let mut driver = handles.driver.lock().await;
+            if driver.state().status == pa_core::goals::GoalStatus::Blocked {
+                drop(driver);
+                self.clear_autonomous_continuations();
+                return GoalBoundary::End;
+            }
             if !driver.owns_continuation_wakeup() {
                 let mut session = handles.session.lock().await;
                 if driver.owes_continuation() {
@@ -425,6 +430,10 @@ impl AgentSessionEngine {
             return None;
         }
         *published = Some(goal.clone());
+        drop(published);
+        if goal.status == pa_core::goals::GoalStatus::Blocked {
+            crate::engine::SessionEngine::purge_queued_goal_contexts(self);
+        }
         Some(serde_json::to_value(goal).unwrap_or(serde_json::Value::Null))
     }
 

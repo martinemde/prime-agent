@@ -69,6 +69,19 @@ impl AgentSessionEngine {
         // Exactly one wake per window: the prior job retires before the
         // replacement arms — repeated boundaries must never stack marker
         // turns.
+        let handles = self
+            .goal_runtime
+            .lock()
+            .expect("goal runtime lock")
+            .clone()?;
+        // Serialize arming with goal mutations: a block either prevents this job
+        // or follows it and durably cancels it before purging the worker queue.
+        let driver = handles.driver.lock().await;
+        if driver.state().status != pa_core::goals::GoalStatus::Active
+            || driver.backoff_wake_at() != Some(wake_at_ms)
+        {
+            return None;
+        }
         self.cancel_goal_backoff_wake();
         let wiring = self.cron_wiring()?;
         let binding = self.kernel_cron_binding()?;
@@ -162,7 +175,7 @@ impl AgentSessionEngine {
     /// to read (the next emitted event re-checks). The served state reads the
     /// creation-based age fresh from `created_at` (no anchor, no
     /// compounding).
-    pub(super) fn current_goal_state(&self) -> Option<pa_core::goals::GoalState> {
+    pub(crate) fn current_goal_state(&self) -> Option<pa_core::goals::GoalState> {
         let handles = self
             .goal_runtime
             .lock()

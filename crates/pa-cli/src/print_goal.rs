@@ -49,6 +49,8 @@ pub(crate) enum NaturalContinuation {
     /// A pending requested compaction consumes the stop: no mint, the boundary consumes the
     /// request.
     RequestedCompaction,
+    /// A recorded dependency stops both goal and autonomous continuations.
+    Blocked,
     /// A threshold compaction is due: the loop stops (any owed mint is held for the post-compaction
     /// admission), the boundary compacts.
     ThresholdDue,
@@ -477,6 +479,10 @@ impl PrintGoalSurface {
         if engine.turn_boundary.compaction_scheduled().await {
             return NaturalContinuation::RequestedCompaction;
         }
+        if engine.goal_state().await.status == pa_types::goal::GoalStatus::Blocked {
+            engine.drop_owed_goal_continuation().await;
+            return NaturalContinuation::Blocked;
+        }
         // The daemon's consult order: a goal that does not own the
         // wake-up drops any armed RLM deferral (the deferral dies with
         // the goal's loop); only an owning goal gates behind unsettled
@@ -492,8 +498,12 @@ impl PrintGoalSurface {
         // The threshold arm: the crossing turn mints BEFORE the loop stops; the
         // boundary compacts, and the driver runs the held turn post-compaction.
         if engine.session.auto_compaction_due(model).await {
-            if let Some(message) = engine.mint_goal_continuation().await {
-                self.publish_goal_update(engine).await;
+            let message = engine.mint_goal_continuation().await;
+            self.publish_goal_update(engine).await;
+            if engine.goal_state().await.status == pa_types::goal::GoalStatus::Blocked {
+                return NaturalContinuation::Blocked;
+            }
+            if let Some(message) = message {
                 self.hold_threshold_continuation(message).await;
             }
             return NaturalContinuation::ThresholdDue;
@@ -503,8 +513,12 @@ impl PrintGoalSurface {
         }
         // The natural continuation mint: the goal's context turn runs as the next
         // turn of the same run; a row that cannot convert drops the mint.
-        if let Some(message) = engine.mint_goal_continuation().await {
-            self.publish_goal_update(engine).await;
+        let message = engine.mint_goal_continuation().await;
+        self.publish_goal_update(engine).await;
+        if engine.goal_state().await.status == pa_types::goal::GoalStatus::Blocked {
+            return NaturalContinuation::Blocked;
+        }
+        if let Some(message) = message {
             engine.clear_pending_goal_continuation().await;
             return match custom_message_to_loop_row(&message) {
                 Some(row) => NaturalContinuation::GoalRow(Box::new(row)),
@@ -970,6 +984,58 @@ mod tests {
         json!({ "compaction": { "enabled": false } })
     }
 
+    #[tokio::test]
+    async fn blocked_goal_stops_natural_and_held_autonomous_continuations() {
+        let _guard = FAUX_TEST_LOCK.lock().await;
+        let bed = goal_bed(
+            script(&json!(["must not run"]), 128_000),
+            no_compaction(),
+            Some(("ship it", None)),
+        )
+        .await;
+        {
+            let persistence = bed.engine.session.shared_persistence();
+            let mut driver = bed.engine.goal_driver.lock().await;
+            let mut session = persistence.lock().await;
+            driver
+                .block(
+                    &mut session,
+                    pa_types::goal::GoalBlocker {
+                        reason: "Need approval".to_string(),
+                        waiting_on: pa_types::goal::GoalWaitingOn::User,
+                        resume_when: "User approves".to_string(),
+                        independent_work_remaining: false,
+                    },
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            bed.surface
+                .natural_continuation(&bed.engine, &bed.model, false)
+                .await,
+            NaturalContinuation::Blocked
+        ));
+        bed._autonomous_run
+            .hold_threshold_continuation("must not run".to_string())
+            .await;
+        let mut boundary = crate::print_boundary::TurnBoundary::new(false);
+        assert!(!bed
+            ._autonomous_run
+            .drive_boundary(
+                &bed.engine,
+                &mut boundary,
+                &bed.model,
+                None,
+                bed.harness_dir.clone()
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            bed.engine.goal_state().await.status,
+            pa_types::goal::GoalStatus::Blocked
+        );
+    }
+
     /// The context row lands ahead of the user row (its slot still zero), and the
     /// seed never announces.
     #[tokio::test]
@@ -1163,7 +1229,7 @@ mod tests {
         );
     }
 
-    /// Three consecutive empty turns end the goal at the cap after exactly three model
+    /// Three consecutive empty turns block the goal at the cap after exactly three model
     /// calls — the third wake never runs.
     #[tokio::test(start_paused = true)]
     async fn three_empty_turns_hit_the_cap_with_exactly_three_model_calls() {
@@ -1185,9 +1251,9 @@ mod tests {
         assert!(!owns, "the capped goal no longer owns the boundary");
         assert_eq!(wake_marker_rows(&bed.engine).await, 2);
         let goal = bed.engine.goal_state().await;
-        assert_eq!(goal.status, pa_types::goal::GoalStatus::Error);
+        assert_eq!(goal.status, pa_types::goal::GoalStatus::Blocked);
         assert_eq!(
-            goal.last_error.as_deref(),
+            goal.last_reason.as_deref(),
             Some(pa_core::session_engine::goal_driver::CONTINUATION_NO_PROGRESS_CAP_REASON)
         );
         assert_eq!(goal.no_progress_streak, Some(3));
